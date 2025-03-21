@@ -36,14 +36,14 @@ var terminalMethods = map[string]bool{
 
 // run implements the main analysis logic for the zerologctx linter.
 func run(pass *analysis.Pass) (interface{}, error) {
-	inspector := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	// We're only interested in method call expressions
 	nodeFilter := []ast.Node{
 		(*ast.CallExpr)(nil),
 	}
 
-	inspector.Preorder(nodeFilter, func(n ast.Node) {
+	insp.Preorder(nodeFilter, func(n ast.Node) {
 		call := n.(*ast.CallExpr)
 
 		// Check if this is a method call (has a selector)
