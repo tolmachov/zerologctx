@@ -72,12 +72,15 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 		// Check if .Ctx(ctx) was called anywhere in the chain
 		if !hasCtxInChain(pass, sel.X) {
-			// Report the issue with a helpful message
-			pass.Reportf(
-				call.Pos(),
-				"zerolog event missing .Ctx(ctx) before %s() - context should be included for proper log correlation",
-				methodName,
-			)
+			// Check for //nolint:zerologctx directive
+			if !hasNoLintDirective(pass, call) {
+				// Report the issue with a helpful message
+				pass.Reportf(
+					call.Pos(),
+					"zerolog event missing .Ctx(ctx) before %s() - context should be included for proper log correlation",
+					methodName,
+				)
+			}
 		}
 	})
 
@@ -124,4 +127,53 @@ func isContextType(typeStr string) bool {
 	return typeStr == "context.Context" ||
 		strings.Contains(typeStr, "context.Context") ||
 		strings.HasSuffix(typeStr, ".Context")
+}
+
+// hasNoLintDirective checks if there's a nolint directive for zerologctx on the node.
+// It looks at file comments around the position of the node to detect directives.
+func hasNoLintDirective(pass *analysis.Pass, call *ast.CallExpr) bool {
+	// Get position info for the node
+	pos := call.Pos()
+	file := pass.Fset.File(pos)
+	if file == nil {
+		return false
+	}
+
+	// Get comment groups from file AST
+	nodeFile := -1
+	for i, f := range pass.Files {
+		if file == pass.Fset.File(f.Pos()) {
+			nodeFile = i
+			break
+		}
+	}
+
+	if nodeFile == -1 {
+		return false
+	}
+
+	// Check comment groups for end-of-line comments
+	nodeLine := file.Line(pos)
+	for _, commentGroup := range pass.Files[nodeFile].Comments {
+		// Check if any comment in the group is on the same line as the node
+		for _, comment := range commentGroup.List {
+			commentLine := file.Line(comment.Pos())
+
+			// Only consider comments on the same line or the line before
+			if commentLine != nodeLine && commentLine != nodeLine-1 {
+				continue
+			}
+
+			// Check if it contains a nolint directive for this linter
+			commentText := comment.Text
+			if strings.Contains(commentText, "//nolint:zerologctx") ||
+				strings.Contains(commentText, "// nolint:zerologctx") ||
+				strings.Contains(commentText, "//nolint: zerologctx") ||
+				strings.Contains(commentText, "// nolint: zerologctx") {
+				return true
+			}
+		}
+	}
+
+	return false
 }

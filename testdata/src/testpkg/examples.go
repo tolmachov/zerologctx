@@ -72,6 +72,44 @@ func edgeCases() {
 	event.Ctx(ctx).Msg("Using saved event")
 }
 
+// nolintDirectives demonstrates the use of nolint directives to suppress linter warnings
+func nolintDirectives() {
+	// These log events are missing Ctx() but have nolint directives to suppress warnings
+
+	// Single line nolint directive
+	//nolint:zerologctx
+	log.Info().Msg("This should not trigger a warning due to nolint directive")
+
+	// Single line nolint directive with space
+	// nolint:zerologctx
+	log.Info().Msg("This should not trigger a warning due to nolint directive with space")
+
+	// Single line nolint directive with space after colon
+	//nolint: zerologctx
+	log.Info().Msg("This should not trigger a warning due to nolint directive with space after colon")
+
+	// Single line nolint directive with spaces
+	// nolint: zerologctx
+	log.Info().Msg("This should not trigger a warning due to nolint directive with spaces")
+
+	// End-of-line nolint directives
+	log.Info().Msg("This should not trigger a warning") //nolint:zerologctx
+	log.Info().Msg("This should not trigger a warning") // nolint:zerologctx
+	log.Info().Msg("This should not trigger a warning") //nolint: zerologctx
+	log.Info().Msg("This should not trigger a warning") // nolint: zerologctx
+
+	// This should trigger a warning - comment is not a nolint directive
+	// Just a regular comment
+	log.Info().Msg("This should trigger a warning") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
+	// This should trigger a warning - wrong linter name
+	//nolint:someotherlinter
+	log.Info().Msg("This should trigger a warning") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
+	// This should trigger a warning - wrong linter name in end-of-line comment
+	log.Info().Msg("This should trigger a warning") //nolint:someotherlinter // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+}
+
 // Helper types for testing
 
 type fakeThing struct{}
