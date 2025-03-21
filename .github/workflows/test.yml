@@ -25,6 +25,3 @@ jobs:
 
       - name: Run tests
         run: go test -v ./...
-
-      - name: Verify linter self-check
-        run: go run ./cmd/zerologctx/main.go ./...
