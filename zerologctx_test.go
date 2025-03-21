@@ -13,7 +13,7 @@ import (
 func TestAnalyzer(t *testing.T) {
 	// Get the test data directory
 	testdata := analysistest.TestData()
-	
+
 	// Run the analyzer on the test package
 	analysistest.Run(t, testdata, Analyzer, "testpkg")
 }
@@ -26,7 +26,7 @@ func TestAnalyzerHelpers(t *testing.T) {
 		expected bool
 	}{
 		{"context.Context", true},
-		{"*context.Context", true}, 
+		{"*context.Context", true},
 		{"foo.Context", true},
 		{"somepackage.context.Context", true},
 		{"string", false},
