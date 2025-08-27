@@ -2,8 +2,8 @@
 // include context using the Ctx() method before terminal operations.
 //
 // The linter analyzes Go code to detect zerolog Event chains and ensures
-// that the Ctx(ctx) method is called before terminal methods like Msg()
-// or Send(). This helps maintain consistent context propagation in logs.
+// that the Ctx(ctx) method is called before terminal methods like Msg(),
+// Msgf() or Send(). This helps maintain consistent context propagation in logs.
 package zerologctx
 
 import (
@@ -22,7 +22,7 @@ var Analyzer = &analysis.Analyzer{
 	Name: "zerologctx",
 	Doc: `Ensures zerolog events include context via the Ctx() method.
 This analyzer reports whenever a zerolog event uses terminal methods like
-Msg() or Send() without calling Ctx(ctx) first in the chain.`,
+Msg(), Msgf() or Send() without calling Ctx(ctx) first in the chain.`,
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
@@ -31,6 +31,7 @@ Msg() or Send() without calling Ctx(ctx) first in the chain.`,
 // and should be preceded by Ctx() in the method chain.
 var terminalMethods = map[string]bool{
 	"Msg":  true, // log.Info().Msg("message")
+	"Msgf": true, // log.Info().Msgf("message %d", 42)
 	"Send": true, // log.Info().Send()
 }
 
