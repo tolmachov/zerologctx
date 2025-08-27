@@ -30,6 +30,9 @@ func correctUsage() {
 	log.Info().Ctx(ctx).Msgf("User %s logged in at %d", "alice", 123456)
 	log.Error().Ctx(ctx).Err(err).Msgf("Failed to process request: %v", err)
 
+	// Correct usage with MsgFunc() for lazy evaluation
+	log.Info().Ctx(ctx).MsgFunc(func() string { return "Expensive computation result" })
+
 	// Correct usage with a custom logger
 	logger := zerolog.New(os.Stdout)
 	logger.Info().Ctx(ctx).Str("key", "value").Msg("This is correct with custom logger")
@@ -66,6 +69,9 @@ func incorrectUsage() {
 
 	// Incorrect with Msgf() formatted message
 	log.Info().Msgf("User %s logged in", "alice") // want "zerolog event missing .Ctx\\(ctx\\) before Msgf\\(\\) - context should be included for proper log correlation"
+
+	// Incorrect with MsgFunc() for lazy evaluation
+	log.Error().MsgFunc(func() string { return "Missing context" }) // want "zerolog event missing .Ctx\\(ctx\\) before MsgFunc\\(\\) - context should be included for proper log correlation"
 
 	// Incorrect usage with a custom logger
 	logger := zerolog.New(zerolog.NewConsoleWriter())

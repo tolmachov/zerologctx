@@ -54,6 +54,11 @@ func (e *Event) Send() {
 	// Terminal method that outputs a log message without text
 }
 
+// MsgFunc sends the event with a message created by the provided function
+func (e *Event) MsgFunc(createMsg func() string) {
+	// Terminal method that outputs a log message created by function
+}
+
 // New creates a new logger
 func New(w interface{}) Logger {
 	return Logger{}
