@@ -10,8 +10,8 @@ func Test_Main(t *testing.T) {
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()
 
-	// Test that main function can be called without panicking
-	// We set Args to simulate running with -h flag to avoid actual analysis
+	// Test that the main function can be called without panicking
+	// We set Args to simulate running with an -h flag to avoid actual analysis
 	os.Args = []string{"zerologctx", "-h"}
 
 	// Capture the fact that main() will call os.Exit
