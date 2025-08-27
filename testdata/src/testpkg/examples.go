@@ -119,6 +119,17 @@ func nolintDirectives() {
 
 	// This should trigger a warning - wrong linter name in end-of-line comment
 	log.Info().Msg("This should trigger a warning") //nolint:someotherlinter // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
+	// Test multiple linters in nolint directives
+	//nolint:linter1,zerologctx,linter2
+	log.Info().Msg("Multiple linters with zerologctx - should not trigger")
+
+	//   nolint: another1, zerologctx, another2
+	log.Error().Str("test", "value").Msg("Multiple linters with spaces - should not trigger")
+
+	log.Debug().Msg("Multiple linters inline") //nolint:foo,zerologctx,bar
+
+	log.Warn().Msg("Multiple linters without zerologctx") //nolint:foo,bar,baz // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
 // Helper types for testing

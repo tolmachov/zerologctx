@@ -45,12 +45,36 @@ func TestAnalyzerHelpers(t *testing.T) {
 		}
 	})
 
-	// Test the hasNoLintDirective function
-	t.Run("hasNoLintDirective", func(t *testing.T) {
-		// This test requires a complex setup to create an analysis.Pass and AST nodes
-		// Therefore, we rely on the integration test in TestAnalyzer which verifies
-		// that nolint directives work properly using the test cases in testdata/src/testpkg/examples.go
-		// The TestAnalyzer function will automatically verify that lines with nolint directives
-		// do not produce diagnostics, while lines without them do
+	// Test the isNoLintComment function
+	t.Run("isNoLintComment", func(t *testing.T) {
+		testCases := []struct {
+			comment  string
+			linter   string
+			expected bool
+		}{
+			{"//nolint:zerologctx", "zerologctx", true},
+			{"// nolint:zerologctx", "zerologctx", true},
+			{"//nolint: zerologctx", "zerologctx", true},
+			{"// nolint: zerologctx", "zerologctx", true},
+			{"//   nolint: zerologctx", "zerologctx", true},
+			{"//nolint:linter1,zerologctx,linter2", "zerologctx", true},
+			{"//nolint:linter1, zerologctx, linter2", "zerologctx", true},
+			{"//   nolint: another1,zerologctx,another2", "zerologctx", true},
+			{"//   nolint: another1, zerologctx, another2", "zerologctx", true},
+			{"//nolint:otherlinter", "zerologctx", false},
+			{"//nolint:linter1,linter2", "zerologctx", false},
+			{"// just a comment", "zerologctx", false},
+			{"//nolint", "zerologctx", false},  // missing colon
+			{"//nolint:", "zerologctx", false}, // empty linter list
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.comment, func(t *testing.T) {
+				got := isNoLintComment(tc.comment, tc.linter)
+				if got != tc.expected {
+					t.Errorf("isNoLintComment(%q, %q) = %v, want %v", tc.comment, tc.linter, got, tc.expected)
+				}
+			})
+		}
 	})
 }

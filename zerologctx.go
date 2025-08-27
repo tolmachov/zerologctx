@@ -191,13 +191,50 @@ func hasNoLintDirective(pass *analysis.Pass, call *ast.CallExpr) bool {
 			}
 
 			// Check if it contains a nolint directive for this linter
-			commentText := comment.Text
-			if strings.Contains(commentText, "//nolint:zerologctx") ||
-				strings.Contains(commentText, "// nolint:zerologctx") ||
-				strings.Contains(commentText, "//nolint: zerologctx") ||
-				strings.Contains(commentText, "// nolint: zerologctx") {
+			if isNoLintComment(comment.Text, "zerologctx") {
 				return true
 			}
+		}
+	}
+
+	return false
+}
+
+// isNoLintComment checks if a comment is a nolint directive for the specified linter.
+// It handles various formats like:
+// - //nolint:zerologctx
+// - // nolint: zerologctx
+// - //nolint:linter1,zerologctx,linter2
+// - //   nolint: another1, zerologctx, another2
+func isNoLintComment(commentText, linterName string) bool {
+	// Remove // prefix
+	text := strings.TrimPrefix(commentText, "//")
+
+	// Trim spaces
+	text = strings.TrimSpace(text)
+
+	// Check if it starts with "nolint"
+	if !strings.HasPrefix(text, "nolint") {
+		return false
+	}
+
+	// Remove "nolint" prefix
+	text = strings.TrimPrefix(text, "nolint")
+
+	// Check for colon
+	if !strings.HasPrefix(text, ":") {
+		return false
+	}
+
+	// Remove colon and trim spaces
+	text = strings.TrimPrefix(text, ":")
+	text = strings.TrimSpace(text)
+
+	// Split by comma and check each linter
+	linters := strings.Split(text, ",")
+	for _, linter := range linters {
+		if strings.TrimSpace(linter) == linterName {
+			return true
 		}
 	}
 
