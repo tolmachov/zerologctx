@@ -142,3 +142,13 @@ type Context struct{}
 func (c *Context) Logger() Logger {
 	return Logger{}
 }
+
+// Ctx adds context to the Context
+func (c *Context) Ctx(ctx interface{}) *Context {
+	return c
+}
+
+// Str adds a string field to the context
+func (c *Context) Str(key string, value string) *Context {
+	return c
+}

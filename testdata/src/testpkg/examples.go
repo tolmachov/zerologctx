@@ -33,6 +33,17 @@ func correctUsage() {
 	// Correct usage with derived context
 	childCtx := context.WithValue(ctx, "key", "value")
 	log.Info().Ctx(childCtx).Msg("This is correct with child context")
+
+	// Correct usage: context was added to logger in a separate statement
+	// Logger created with context embedded
+	loggerWithCtx := log.With().Ctx(ctx).Logger()
+	loggerWithCtx.Info().Msg("This should NOT trigger - context is in the logger")
+	loggerWithCtx.Error().Str("error", "test").Msg("Context already in logger")
+
+	// Another variation with custom logger
+	customLoggerWithCtx := zerolog.New(os.Stdout).With().Ctx(ctx).Logger()
+	customLoggerWithCtx.Info().Msg("Custom logger with embedded context")
+	customLoggerWithCtx.Debug().Int("id", 123).Send()
 }
 
 // incorrectUsage demonstrates patterns that should trigger the linter.
