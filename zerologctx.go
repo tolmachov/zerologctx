@@ -48,6 +48,10 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	// This allows proper tracking of context through variable assignments
 	eventsWithContext := make(map[string]bool)
 
+	// Cache for hasCtxInChain results to improve performance
+	// This memoization prevents redundant traversal of the same AST subtrees
+	ctxChainCache := make(map[ast.Expr]bool)
+
 	// First pass: identify loggers created with context and Event variables with context
 	nodeFilter := []ast.Node{
 		(*ast.AssignStmt)(nil),
@@ -118,7 +122,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			hasContext := false
 
 			// First check if .Ctx(ctx) was called in the event chain
-			if hasCtxInChain(pass, sel.X) {
+			if hasCtxInChainCached(pass, sel.X, ctxChainCache) {
 				hasContext = true
 			}
 
@@ -148,6 +152,23 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	})
 
 	return nil, nil
+}
+
+// hasCtxInChainCached is a wrapper around hasCtxInChain that uses memoization
+// to avoid redundant traversal of the same AST subtrees.
+func hasCtxInChainCached(pass *analysis.Pass, expr ast.Expr, cache map[ast.Expr]bool) bool {
+	// Check if result is already cached
+	if result, ok := cache[expr]; ok {
+		return result
+	}
+
+	// Compute the result
+	result := hasCtxInChain(pass, expr)
+
+	// Cache the result
+	cache[expr] = result
+
+	return result
 }
 
 // hasCtxInChain walks up the method call chain to check if Ctx(context) appears.
