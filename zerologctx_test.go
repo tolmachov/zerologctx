@@ -28,11 +28,15 @@ func TestAnalyzerHelpers(t *testing.T) {
 		}{
 			{"context.Context", true},
 			{"*context.Context", true},
-			{"foo.Context", true},
-			{"somepackage.context.Context", true},
+			{"foo.Context", false},                  // BUG #3 FIX: Now correctly rejects non-context types
+			{"db.Context", false},                   // Should reject database context
+			{"custom.Context", false},               // Should reject custom context types
+			{"somepackage.context.Context", true},   // Vendored or full path context
+			{"github.com/pkg/context.Context", true}, // Module path context
 			{"string", false},
 			{"Context", false},
 			{"contextual", false},
+			{"interface{context.Context}", true}, // Interface containing context
 		}
 
 		for _, tc := range testCases {

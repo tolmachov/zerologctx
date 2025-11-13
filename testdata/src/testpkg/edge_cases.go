@@ -70,12 +70,12 @@ func TestInvalidContextType() {
 	// However, our type checker should catch this
 	_ = fakeCtx
 
-	// Using a string as context - currently triggers false positive
-	// BUG: The linter doesn't properly validate the Ctx() argument type
+	// Using a string as context - now correctly detected
+	// BUG #1 FIXED: The linter now properly validates the Ctx() argument type
 	log.Info().Ctx("not-a-context").Msg("Invalid context type") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 
-	// Using nil as context - currently triggers false positive
-	// BUG: The linter doesn't properly validate the Ctx() argument type
+	// Using nil as context - now correctly detected
+	// BUG #1 FIXED: The linter now properly validates the Ctx() argument type
 	log.Info().Ctx(nil).Msg("Nil context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
@@ -84,11 +84,11 @@ func TestVariableChains() {
 	ctx := context.Background()
 
 	// Build event step by step
-	// BUG: The linter doesn't track context through variable assignments
+	// BUG #2 FIXED: The linter now tracks context through variable assignments
 	event1 := log.Info()
 	event2 := event1.Str("key", "value")
 	event3 := event2.Ctx(ctx)
-	event3.Msg("This should be OK - context added in chain") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	event3.Msg("This should be OK - context added in chain")
 
 	// Build event without context
 	ev1 := log.Error()
