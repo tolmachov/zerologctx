@@ -43,7 +43,11 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	// Track loggers that have context embedded
 	loggersWithContext := make(map[string]bool)
 
-	// First pass: identify loggers created with context
+	// Track Event variables that have context in their chain
+	// This fixes BUG #2: tracking context through variable assignments
+	eventsWithContext := make(map[string]bool)
+
+	// First pass: identify loggers created with context and Event variables with context
 	nodeFilter := []ast.Node{
 		(*ast.AssignStmt)(nil),
 		(*ast.CallExpr)(nil),
@@ -52,12 +56,36 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	insp.Preorder(nodeFilter, func(n ast.Node) {
 		switch node := n.(type) {
 		case *ast.AssignStmt:
-			// Look for assignments like: loggerWithCtx := log.With().Ctx(ctx).Logger()
-			if len(node.Lhs) == 1 && len(node.Rhs) == 1 {
-				if ident, ok := node.Lhs[0].(*ast.Ident); ok {
-					if isLoggerWithContext(pass, node.Rhs[0]) {
-						loggersWithContext[ident.Name] = true
-					}
+			// Handle assignments - can be multiple (e.g., a, b := ...)
+			for i, lhs := range node.Lhs {
+				if i >= len(node.Rhs) {
+					// Short circuit for assignments like a, b = c, d where we run out of RHS
+					break
+				}
+
+				ident, ok := lhs.(*ast.Ident)
+				if !ok {
+					continue
+				}
+
+				rhs := node.Rhs[i]
+				if len(node.Rhs) == 1 && len(node.Lhs) > 1 {
+					// Multiple assignment from single expression (e.g., a, b := fn())
+					// We can't easily track this, skip
+					continue
+				}
+
+				// Check if this is a logger with context: loggerWithCtx := log.With().Ctx(ctx).Logger()
+				if isLoggerWithContext(pass, rhs) {
+					loggersWithContext[ident.Name] = true
+					continue
+				}
+
+				// Check if this is an Event with context in its chain
+				// This fixes BUG #2: event := log.Info().Ctx(ctx)
+				if isEventWithContext(pass, rhs, eventsWithContext) {
+					eventsWithContext[ident.Name] = true
+					continue
 				}
 			}
 		case *ast.CallExpr:
@@ -96,6 +124,12 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			// If not, check if the event came from a logger with embedded context
 			if !hasContext {
 				hasContext = isEventFromLoggerWithContext(pass, sel.X, loggersWithContext)
+			}
+
+			// If not, check if the event came from a variable that has context
+			// This fixes BUG #2: tracking context through variables
+			if !hasContext {
+				hasContext = isEventFromVariableWithContext(sel.X, eventsWithContext)
 			}
 
 			if !hasContext {
@@ -150,11 +184,28 @@ func hasCtxInChain(pass *analysis.Pass, expr ast.Expr) bool {
 }
 
 // isContextType checks if a type string represents a context.Context type.
-// It handles various ways the context type might appear in the type system.
+// It handles various ways the context type might appear in the type system,
+// but rejects types that just happen to end with .Context (like db.Context).
 func isContextType(typeStr string) bool {
-	return typeStr == "context.Context" ||
-		strings.Contains(typeStr, "context.Context") ||
-		strings.HasSuffix(typeStr, ".Context")
+	// Exact match for context.Context
+	if typeStr == "context.Context" {
+		return true
+	}
+
+	// Pointer to context.Context
+	if typeStr == "*context.Context" {
+		return true
+	}
+
+	// Contains context.Context anywhere (handles vendored or module paths)
+	// e.g., "github.com/some/vendor/context.Context" or "interface{context.Context}"
+	if strings.Contains(typeStr, "context.Context") {
+		return true
+	}
+
+	// Don't accept just any type ending with .Context
+	// This was the bug - it would accept db.Context, custom.Context, etc.
+	return false
 }
 
 // hasNoLintDirective checks if there's a nolint directive for zerologctx on the node.
@@ -316,6 +367,72 @@ func isEventFromLoggerWithContext(pass *analysis.Pass, expr ast.Expr, loggersWit
 				if loggersWithContext[ident.Name] {
 					return true
 				}
+			}
+		}
+
+		// Continue walking up the chain
+		expr = sel.X
+	}
+
+	return false
+}
+
+// isEventWithContext checks if an expression represents an Event with context in its chain.
+// This is used to track Event variables like: event := log.Info().Ctx(ctx)
+func isEventWithContext(pass *analysis.Pass, expr ast.Expr, eventsWithContext map[string]bool) bool {
+	// Check if this expression has type *zerolog.Event
+	typeInfo := pass.TypesInfo.Types[expr]
+	if typeInfo.Type == nil {
+		return false
+	}
+
+	typeString := typeInfo.Type.String()
+	if !strings.Contains(typeString, "zerolog.Event") {
+		return false
+	}
+
+	// Check if the expression is a call chain with Ctx()
+	if hasCtxInChain(pass, expr) {
+		return true
+	}
+
+	// Check if the expression references a variable that has context
+	if isEventFromVariableWithContext(expr, eventsWithContext) {
+		return true
+	}
+
+	return false
+}
+
+// isEventFromVariableWithContext checks if an expression is or references a variable
+// that has context tracked in eventsWithContext map.
+// This handles cases like: event1 := log.Info().Ctx(ctx); event2 := event1.Str("k", "v"); event2.Msg("text")
+func isEventFromVariableWithContext(expr ast.Expr, eventsWithContext map[string]bool) bool {
+	// Walk up the chain looking for identifiers
+	for expr != nil {
+		// Check if this is a direct identifier reference
+		if ident, ok := expr.(*ast.Ident); ok {
+			if eventsWithContext[ident.Name] {
+				return true
+			}
+			return false
+		}
+
+		// Check if this is a method call on something
+		call, ok := expr.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+
+		// Check if the receiver is an identifier with context
+		if ident, ok := sel.X.(*ast.Ident); ok {
+			if eventsWithContext[ident.Name] {
+				return true
 			}
 		}
 

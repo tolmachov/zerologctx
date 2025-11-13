@@ -110,7 +110,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.24'
+        go-version: '1.23'
     
     - name: Install zerologctx
       run: go install github.com/tolmachov/zerologctx/cmd/zerologctx@latest
