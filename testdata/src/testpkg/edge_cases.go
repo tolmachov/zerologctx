@@ -101,7 +101,7 @@ func TestVariableChains() {
 
 	// Multiple assignment (edge case)
 	logger1, logger2 := zerolog.New(os.Stdout), zerolog.New(os.Stderr)
-	logger1.Info().Msg("Should trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	logger1.Info().Msg("Should trigger")       // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 	logger2.Error().Msg("Should also trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
@@ -178,8 +178,8 @@ func TestLogLevels() {
 	// All log levels without context - should trigger
 	log.Trace().Msg("Trace without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 	log.Debug().Msg("Debug without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
-	log.Info().Msg("Info without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
-	log.Warn().Msg("Warn without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	log.Info().Msg("Info without context")   // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	log.Warn().Msg("Warn without context")   // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 	log.Error().Msg("Error without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 
 	// Fatal and Panic might be special cases where context is less critical?
