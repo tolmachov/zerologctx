@@ -504,10 +504,7 @@ func isEventFromVariableWithContext(expr ast.Expr, eventsWithContext map[string]
 	for expr != nil {
 		// Check if this is a direct identifier reference
 		if ident, ok := expr.(*ast.Ident); ok {
-			if eventsWithContext[ident.Name] {
-				return true
-			}
-			return false
+			return eventsWithContext[ident.Name]
 		}
 
 		// Check if this is a method call on something
