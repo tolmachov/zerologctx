@@ -8,6 +8,7 @@ package zerologctx
 
 import (
 	"go/ast"
+	"go/types"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
@@ -154,6 +155,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 //
 // For a chain like log.Info().Str("key", "val").Ctx(ctx).Msg("message"),
 // it checks if Ctx() with a context argument appears anywhere before Msg().
+//
+// IMPORTANT: This only counts Ctx() calls on *zerolog.Event, not on zerolog.Logger.
+// log.Ctx(ctx) returns a Logger and doesn't add context to the Event.
 func hasCtxInChain(pass *analysis.Pass, expr ast.Expr) bool {
 	// The expression must be a function call
 	call, ok := expr.(*ast.CallExpr)
@@ -173,9 +177,18 @@ func hasCtxInChain(pass *analysis.Pass, expr ast.Expr) bool {
 		arg := call.Args[0]
 		argType := pass.TypesInfo.TypeOf(arg)
 
-		// Check various forms of context types
-		if argType != nil && isContextType(argType.String()) {
-			return true
+		if argType != nil && isContextType(pass, argType) {
+			// IMPORTANT: Also verify that Ctx() is being called on a *zerolog.Event
+			// and not on a zerolog.Logger. log.Ctx(ctx) returns a Logger, which
+			// doesn't guarantee the Event will have context.
+			receiverType := pass.TypesInfo.Types[sel.X]
+			if receiverType.Type != nil {
+				receiverTypeStr := receiverType.Type.String()
+				// Only count it if called on *zerolog.Event
+				if strings.Contains(receiverTypeStr, "zerolog.Event") {
+					return true
+				}
+			}
 		}
 	}
 
@@ -183,10 +196,16 @@ func hasCtxInChain(pass *analysis.Pass, expr ast.Expr) bool {
 	return hasCtxInChain(pass, sel.X)
 }
 
-// isContextType checks if a type string represents a context.Context type.
-// It handles various ways the context type might appear in the type system,
-// but rejects types that just happen to end with .Context (like db.Context).
-func isContextType(typeStr string) bool {
+// isContextType checks if a type represents or implements context.Context.
+// It handles direct context.Context types, pointers, and types that embed context.Context.
+func isContextType(pass *analysis.Pass, typ types.Type) bool {
+	if typ == nil {
+		return false
+	}
+
+	// Get the string representation for quick checks
+	typeStr := typ.String()
+
 	// Exact match for context.Context
 	if typeStr == "context.Context" {
 		return true
@@ -198,14 +217,63 @@ func isContextType(typeStr string) bool {
 	}
 
 	// Contains context.Context anywhere (handles vendored or module paths)
-	// e.g., "github.com/some/vendor/context.Context" or "interface{context.Context}"
+	// e.g., "github.com/some/vendor/context.Context"
 	if strings.Contains(typeStr, "context.Context") {
 		return true
 	}
 
-	// Don't accept just any type ending with .Context
-	// This was the bug - it would accept db.Context, custom.Context, etc.
+	// Check if the type implements context.Context interface
+	// This handles custom types that embed context.Context (e.g., *tasks.Context)
+	// We look for a method set that includes context.Context methods: Deadline, Done, Err, Value
+
+	// For pointer types, check the underlying type's method set
+	if ptr, ok := typ.(*types.Pointer); ok {
+		// Check if pointer implements the interface
+		if implementsContextInterface(ptr) {
+			return true
+		}
+		// Also check the element type
+		if implementsContextInterface(ptr.Elem()) {
+			return true
+		}
+	}
+
+	// For named types, check if they implement the interface
+	if implementsContextInterface(typ) {
+		return true
+	}
+
 	return false
+}
+
+// implementsContextInterface checks if a type has all the methods of context.Context
+func implementsContextInterface(typ types.Type) bool {
+	// Get the method set for the type
+	methodSet := types.NewMethodSet(typ)
+
+	// context.Context requires these methods:
+	// - Deadline() (time.Time, bool)
+	// - Done() <-chan struct{}
+	// - Err() error
+	// - Value(key interface{}) interface{}
+
+	requiredMethods := []string{"Deadline", "Done", "Err", "Value"}
+	foundMethods := 0
+
+	for i := 0; i < methodSet.Len(); i++ {
+		method := methodSet.At(i)
+		methodName := method.Obj().Name()
+
+		for _, required := range requiredMethods {
+			if methodName == required {
+				foundMethods++
+				break
+			}
+		}
+	}
+
+	// If we found all 4 methods, it implements context.Context
+	return foundMethods == len(requiredMethods)
 }
 
 // hasNoLintDirective checks if there's a nolint directive for zerologctx on the node.
@@ -332,7 +400,7 @@ func hasCtxInContextChain(pass *analysis.Pass, expr ast.Expr) bool {
 	if sel.Sel.Name == "Ctx" && len(call.Args) > 0 {
 		arg := call.Args[0]
 		argType := pass.TypesInfo.TypeOf(arg)
-		if argType != nil && isContextType(argType.String()) {
+		if argType != nil && isContextType(pass, argType) {
 			return true
 		}
 	}

@@ -20,34 +20,8 @@ func TestAnalyzer(t *testing.T) {
 
 // TestAnalyzerHelpers tests the helper functions used by the analyzer.
 func TestAnalyzerHelpers(t *testing.T) {
-	// Test the isContextType function
-	t.Run("isContextType", func(t *testing.T) {
-		testCases := []struct {
-			typeName string
-			expected bool
-		}{
-			{"context.Context", true},
-			{"*context.Context", true},
-			{"foo.Context", false},                   // BUG #3 FIX: Now correctly rejects non-context types
-			{"db.Context", false},                    // Should reject database context
-			{"custom.Context", false},                // Should reject custom context types
-			{"somepackage.context.Context", true},    // Vendored or full path context
-			{"github.com/pkg/context.Context", true}, // Module path context
-			{"string", false},
-			{"Context", false},
-			{"contextual", false},
-			{"interface{context.Context}", true}, // Interface containing context
-		}
-
-		for _, tc := range testCases {
-			t.Run(tc.typeName, func(t *testing.T) {
-				got := isContextType(tc.typeName)
-				if got != tc.expected {
-					t.Errorf("isContextType(%q) = %v, want %v", tc.typeName, got, tc.expected)
-				}
-			})
-		}
-	})
+	// Note: isContextType now requires *analysis.Pass and types.Type,
+	// so it's tested through the integration tests in TestAnalyzer instead.
 
 	// Test the isNoLintComment function
 	t.Run("isNoLintComment", func(t *testing.T) {
