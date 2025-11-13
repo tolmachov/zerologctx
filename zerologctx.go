@@ -45,7 +45,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	loggersWithContext := make(map[string]bool)
 
 	// Track Event variables that have context in their chain
-	// This fixes BUG #2: tracking context through variable assignments
+	// This allows proper tracking of context through variable assignments
 	eventsWithContext := make(map[string]bool)
 
 	// First pass: identify loggers created with context and Event variables with context
@@ -83,7 +83,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				}
 
 				// Check if this is an Event with context in its chain
-				// This fixes BUG #2: event := log.Info().Ctx(ctx)
+				// e.g., event := log.Info().Ctx(ctx)
 				if isEventWithContext(pass, rhs, eventsWithContext) {
 					eventsWithContext[ident.Name] = true
 					continue
@@ -128,7 +128,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 
 			// If not, check if the event came from a variable that has context
-			// This fixes BUG #2: tracking context through variables
+			// e.g., tracking context through variables
 			if !hasContext {
 				hasContext = isEventFromVariableWithContext(sel.X, eventsWithContext)
 			}
@@ -246,34 +246,37 @@ func isContextType(pass *analysis.Pass, typ types.Type) bool {
 	return false
 }
 
-// implementsContextInterface checks if a type has all the methods of context.Context
+// implementsContextInterface checks if a type has all the methods of context.Context.
+// The context.Context interface requires four methods: Deadline, Done, Err, and Value.
 func implementsContextInterface(typ types.Type) bool {
 	// Get the method set for the type
 	methodSet := types.NewMethodSet(typ)
 
-	// context.Context requires these methods:
-	// - Deadline() (time.Time, bool)
-	// - Done() <-chan struct{}
-	// - Err() error
-	// - Value(key interface{}) interface{}
+	// context.Context requires these four methods
+	requiredMethods := map[string]bool{
+		"Deadline": false,
+		"Done":     false,
+		"Err":      false,
+		"Value":    false,
+	}
 
-	requiredMethods := []string{"Deadline", "Done", "Err", "Value"}
-	foundMethods := 0
-
+	// Check which required methods are present
 	for i := 0; i < methodSet.Len(); i++ {
 		method := methodSet.At(i)
 		methodName := method.Obj().Name()
-
-		for _, required := range requiredMethods {
-			if methodName == required {
-				foundMethods++
-				break
-			}
+		if _, ok := requiredMethods[methodName]; ok {
+			requiredMethods[methodName] = true
 		}
 	}
 
-	// If we found all 4 methods, it implements context.Context
-	return foundMethods == len(requiredMethods)
+	// Verify all required methods are present
+	for _, found := range requiredMethods {
+		if !found {
+			return false
+		}
+	}
+
+	return true
 }
 
 // hasNoLintDirective checks if there's a nolint directive for zerologctx on the node.

@@ -115,7 +115,21 @@ jobs:
 
 ## What It Checks
 
-This linter detects when zerolog events use terminal methods like `.Msg()` or `.Send()` without first calling `.Ctx(ctx)` in the method chain.
+This linter detects when zerolog events use terminal methods like `.Msg()`, `.Msgf()`, `.MsgFunc()`, or `.Send()` without first calling `.Ctx(ctx)` in the method chain.
+
+### Important Distinction
+
+The linter correctly distinguishes between:
+- `log.Ctx(ctx)` - Returns a `Logger` extracted from context (does NOT add context to events)
+- `event.Ctx(ctx)` - Adds context to a specific `Event` (correct usage)
+
+```go
+// ❌ WRONG - log.Ctx(ctx) doesn't add context to the event
+log.Ctx(ctx).Error().Msg("error")
+
+// ✅ CORRECT - event.Ctx(ctx) adds context to the event
+log.Error().Ctx(ctx).Msg("error")
+```
 
 ### ✅ Correct Usage Patterns
 
@@ -153,6 +167,69 @@ log.Info().Str("action", "test").Send()
 // Missing context with custom logger
 logger := zerolog.New(os.Stdout)
 logger.Info().Str("key", "value").Msg("Custom logger without context")
+```
+
+## Advanced Features
+
+### Custom Context Types
+
+The linter supports custom context types that embed `context.Context`:
+
+```go
+type CustomContext struct {
+    context.Context
+    userID int64
+}
+
+func processRequest(ctx *CustomContext) {
+    // ✅ Works with custom context types
+    log.Info().Ctx(ctx).Msg("Processing request")
+}
+```
+
+### Loggers with Embedded Context
+
+The linter recognizes loggers created with embedded context:
+
+```go
+// Create logger with context
+ctxLogger := log.With().Ctx(ctx).Logger()
+
+// ✅ Events from this logger don't need .Ctx() again
+ctxLogger.Info().Msg("This is fine - context already in logger")
+```
+
+### Variable Tracking
+
+The linter tracks context through variable assignments:
+
+```go
+// ✅ Context tracked through variables
+event := log.Info().Ctx(ctx)
+event.Str("key", "value")
+event.Msg("Message with context")
+
+// Also works with chained variables
+event2 := event.Str("another", "field")
+event2.Msg("Still has context")
+```
+
+### Suppressing False Positives
+
+Use `//nolint:zerologctx` to suppress warnings for specific cases:
+
+```go
+// Single line suppression
+log.Info().Msg("Startup message") //nolint:zerologctx
+
+// Multi-line suppression (comment on line before)
+//nolint:zerologctx
+log.Info().
+    Str("version", "1.0.0").
+    Msg("Application started")
+
+// Multiple linters
+log.Info().Msg("message") //nolint:zerologctx,anotherlinter
 ```
 
 ## Integration with Editors
