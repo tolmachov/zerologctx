@@ -1,34 +1,48 @@
 package main
 
 import (
+	"errors"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 )
 
-func Test_Main(t *testing.T) {
-	// Save original os.Args
-	oldArgs := os.Args
-	defer func() { os.Args = oldArgs }()
+// TestMainHelp builds the binary and runs it with `-h` in a subprocess to
+// verify the CLI entry point links and starts. singlechecker.Main always
+// calls os.Exit, so it cannot be invoked in-process from a test.
+func TestMainHelp(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available in PATH")
+	}
 
-	// Test that the main function can be called without panicking
-	// We set Args to simulate running with an -h flag to avoid actual analysis
-	os.Args = []string{"zerologctx", "-h"}
+	tmp, err := os.MkdirTemp("", "zerologctx-cli-")
+	if err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+	defer os.RemoveAll(tmp)
 
-	// Capture the fact that main() will call os.Exit
-	// by recovering from a panic if one occurs
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("main() panicked: %v", r)
+	bin := tmp + "/zerologctx"
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(bin, "-h")
+	out, err := cmd.CombinedOutput()
+	// `-h` makes singlechecker print usage and exit non-zero (status 2).
+	// A crash (segfault, nil-deref, missing dependency) would produce a
+	// different exit code and must be surfaced explicitly.
+	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("binary -h failed to run (not an exit error): %v\noutput: %s", err, out)
 		}
-	}()
-
-	// Note: main() calls singlechecker.Main which will call os.Exit
-	// In a real test environment, we can't easily test this without
-	// mocking or using a subprocess. This test at least ensures
-	// the code compiles and the imports are correct.
-
-	// For a minimal test, we just verify that the main function exists
-	// and can be referenced. The actual testing of the analyzer
-	// is done in the parent package tests.
-	_ = main
+		if exitErr.ExitCode() != 2 {
+			t.Fatalf("binary -h exited with unexpected status %d\noutput: %s", exitErr.ExitCode(), out)
+		}
+	}
+	if !strings.Contains(string(out), "zerologctx") {
+		t.Errorf("binary -h output did not mention zerologctx: %s", out)
+	}
 }

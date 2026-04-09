@@ -65,6 +65,11 @@ func With() *zerolog.Context {
 	return &zerolog.Context{}
 }
 
+// WithLevel creates an event from the global logger at the given level.
+func WithLevel(level zerolog.Level) *zerolog.Event {
+	return Logger.WithLevel(level)
+}
+
 // Ctx returns a sub-logger with the context field
 func Ctx(ctx context.Context) *zerolog.Logger {
 	l := zerolog.Logger{}

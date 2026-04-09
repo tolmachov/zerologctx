@@ -3,7 +3,9 @@ package testpkg
 
 import (
 	"context"
+	"os"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -38,4 +40,14 @@ func TestCustomContextPointer() {
 
 	// Should work with pointer to custom context
 	log.Info().Str("user", "test").Ctx(ctx).Msg("pointer to custom context")
+}
+
+// crossFileCollisionVictim is declared in a different file from
+// TestCrossFunctionNameCollision (edge_cases.go) to verify that the
+// scope-keyed maps prevent cross-file, cross-function name collisions.
+// The `logger` with embedded context in TestCrossFunctionNameCollision
+// must not suppress the diagnostic here.
+func crossFileCollisionVictim() {
+	logger := zerolog.New(os.Stdout)
+	logger.Info().Msg("cross-file victim - must trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }

@@ -74,11 +74,8 @@ func incorrectUsage() {
 	log.Error().MsgFunc(func() string { return "Missing context" }) // want "zerolog event missing .Ctx\\(ctx\\) before MsgFunc\\(\\) - context should be included for proper log correlation"
 
 	// Incorrect usage with a custom logger
-	// Note: zerolog.NewConsoleWriter() returns interface{}, causing type analysis issues
-	// This case may not be properly detected
 	logger := zerolog.New(zerolog.NewConsoleWriter())
-	logger.Info().Str("key", "value").Msg("Custom logger without context")
-
+	logger.Info().Str("key", "value").Msg("Custom logger without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
 // edgeCases demonstrates cases that should NOT trigger the linter.
@@ -145,6 +142,19 @@ func nolintDirectives() {
 	log.Debug().Msg("Multiple linters inline") //nolint:foo,zerologctx,bar
 
 	log.Warn().Msg("Multiple linters without zerologctx") //nolint:foo,bar,baz // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
+	// Multi-line chain with nolint on the preceding line exercises the
+	// chainStartLine-1 branch in hasNoLintDirective.
+	//nolint:zerologctx
+	log.Info().
+		Str("key", "value").
+		Msg("multi-line chain suppressed by preceding nolint")
+
+	// Multi-line chain with nolint on the terminal-method line exercises the
+	// terminalLine branch in hasNoLintDirective.
+	log.Info().
+		Str("key", "value").
+		Msg("multi-line chain suppressed by terminal-line nolint") //nolint:zerologctx
 }
 
 // Helper types for testing

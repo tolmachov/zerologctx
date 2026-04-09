@@ -1,11 +1,13 @@
 // Package zerolog is a stub implementation of github.com/rs/zerolog for testing
 package zerolog
 
+import "context"
+
 // Event represents a zerolog event
 type Event struct{}
 
 // Ctx adds context to the event
-func (e *Event) Ctx(ctx interface{}) *Event {
+func (e *Event) Ctx(ctx context.Context) *Event {
 	return e
 }
 
@@ -72,6 +74,19 @@ func NewConsoleWriter() interface{} {
 // Level represents a zerolog log level
 type Level int8
 
+// Log level constants
+const (
+	DebugLevel Level = iota
+	InfoLevel
+	WarnLevel
+	ErrorLevel
+	FatalLevel
+	PanicLevel
+	NoLevel
+	Disabled
+	TraceLevel Level = -1
+)
+
 // Logger represents a zerolog logger
 type Logger struct{}
 
@@ -115,6 +130,11 @@ func (l Logger) Print() *Event {
 	return &Event{}
 }
 
+// WithLevel creates an event with a specific log level
+func (l Logger) WithLevel(level Level) *Event {
+	return &Event{}
+}
+
 // Printf creates a printf level event
 func (l Logger) Printf(format string, v ...interface{}) {
 	// No-op for testing
@@ -149,7 +169,7 @@ func (c *Context) Logger() Logger {
 }
 
 // Ctx adds context to the Context
-func (c *Context) Ctx(ctx interface{}) *Context {
+func (c *Context) Ctx(ctx context.Context) *Context {
 	return c
 }
 

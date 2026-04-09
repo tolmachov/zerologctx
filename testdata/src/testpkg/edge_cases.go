@@ -27,13 +27,14 @@ func TestStructLoggers() {
 	// This should NOT trigger - context added
 	app.logger.Info().Ctx(ctx).Msg("With context")
 
-	// Struct logger with embedded context
+	// Struct logger with embedded context via composite literal
 	appWithCtx := &App{
 		logger: zerolog.New(os.Stdout).With().Ctx(ctx).Logger(),
 	}
-	// This is tricky - the logger has context, but our analyzer may not detect it
-	// because it only tracks identifiers, not struct fields
-	appWithCtx.logger.Info().Msg("This MIGHT trigger incorrectly") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	// The analyzer tracks struct fields via SelectorExpr for assignments, but
+	// composite literal initialization bypasses handleAssign, so the field is
+	// not tracked here. This is a known limitation of the single-pass design.
+	appWithCtx.logger.Info().Msg("Composite literal not tracked") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
 // getLogger returns a logger (function call)
@@ -57,27 +58,18 @@ func TestFunctionLoggers() {
 	getLogger().Info().Ctx(ctx).Msg("With context")
 
 	// Logger with embedded context from function
-	// This is tricky - our analyzer won't know the function returns a logger with context
-	getLoggerWithContext(ctx).Info().Msg("This MIGHT trigger incorrectly") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	// The analyzer cannot infer context from function return values, only from visible
+	// variable declarations and assignments. This correctly triggers as a false positive.
+	getLoggerWithContext(ctx).Info().Msg("Missing context from func return") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
-// TestInvalidContextType tests calling Ctx() with non-context types
-func TestInvalidContextType() {
-	type FakeContext struct{}
-	fakeCtx := FakeContext{}
-
-	// This should trigger - Ctx() called with wrong type
-	// However, our type checker should catch this
-	_ = fakeCtx
-
-	// Using a string as context - now correctly detected
-	// BUG #1 FIXED: The linter now properly validates the Ctx() argument type
-	log.Info().Ctx("not-a-context").Msg("Invalid context type") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
-
-	// Using nil as context - now correctly detected
-	// BUG #1 FIXED: The linter now properly validates the Ctx() argument type
-	log.Info().Ctx(nil).Msg("Nil context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
-}
+// TestInvalidContextType verifies that wrong-type arguments to Ctx() are
+// rejected by the Go type system before the linter even runs. The stub's
+// Ctx(ctx context.Context) signature now matches real zerolog, so passing a
+// string or untyped nil would be a compile error and is no longer testable
+// here. The defensive isContextType check in the analyzer is exercised
+// instead by the custom-context fixtures in custom_context.go.
+func TestInvalidContextType() {}
 
 // TestVariableChains tests more complex variable chains
 func TestVariableChains() {
@@ -186,12 +178,20 @@ func TestLogLevels() {
 	log.Fatal().Msg("Fatal without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 	log.Panic().Msg("Panic without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 
+	// WithLevel without context - should trigger
+	log.WithLevel(zerolog.InfoLevel).Msg("WithLevel without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
+	// Print without context - should trigger
+	log.Print().Msg("Print without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
 	// With context - should NOT trigger
 	log.Trace().Ctx(ctx).Msg("Trace with context")
 	log.Debug().Ctx(ctx).Msg("Debug with context")
 	log.Info().Ctx(ctx).Msg("Info with context")
 	log.Warn().Ctx(ctx).Msg("Warn with context")
 	log.Error().Ctx(ctx).Msg("Error with context")
+	log.WithLevel(zerolog.InfoLevel).Ctx(ctx).Msg("WithLevel with context")
+	log.Print().Ctx(ctx).Msg("Print with context")
 }
 
 // TestSampleMethod tests Sample() which might affect logging
@@ -211,6 +211,40 @@ func TestLogMethod() {
 	log.Log().Msg("Log without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 
 	log.Log().Ctx(ctx).Msg("Log with context")
+}
+
+// TestLogCtxIsLogger pins the load-bearing distinction between
+// log.Ctx(ctx) (which returns a Logger and does NOT attach context to a
+// subsequently created Event) and event.Ctx(ctx) (which does). The first
+// form must still be flagged.
+func TestLogCtxIsLogger() {
+	ctx := context.Background()
+
+	// log.Ctx(ctx) returns a Logger; the resulting Event has no Ctx() call,
+	// so the terminal Msg() must be reported.
+	log.Ctx(ctx).Info().Msg("log.Ctx is a Logger lookup, not Event ctx") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
+	// The fix is to call Ctx on the Event, not the Logger.
+	log.Ctx(ctx).Info().Ctx(ctx).Msg("now correct - Ctx on the Event")
+}
+
+// TestCrossFunctionNameCollision is a regression test for the
+// loggersWithCtx/eventsWithCtx maps being keyed by *types.Object rather than
+// by identifier name. Two functions can both declare a variable named
+// `logger` (one with embedded context, one without) without one polluting
+// the other.
+func TestCrossFunctionNameCollision() {
+	// This function's `logger` has embedded context.
+	ctx := context.Background()
+	logger := log.With().Ctx(ctx).Logger()
+	logger.Info().Msg("OK - this logger has context")
+}
+
+// crossCollisionVictim verifies that the `logger` declared in
+// TestCrossFunctionNameCollision above does not pollute this scope.
+func crossCollisionVictim() {
+	logger := zerolog.New(os.Stdout)
+	logger.Info().Msg("MUST trigger - this logger does not have context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
 // TestInterfacePattern tests logger stored in interface
@@ -258,14 +292,14 @@ func TestPointerLogger() {
 	(*holder.Logger).Info().Ctx(ctx).Msg("Pointer logger with context")
 }
 
-// TestNilContext tests using actual nil as context
+// TestNilContext: a typed-nil context.Context value still has a Ctx() call
+// in the chain with a context.Context-typed argument, so the analyzer treats
+// it as satisfied. (Whether nil propagation is wise at runtime is the user's
+// problem; the linter's job is to enforce that Ctx() was called, not to
+// validate runtime nil-safety.)
 func TestNilContext() {
-	// This is a compile error in real code, but let's see how analyzer handles it
-	// log.Info().Ctx(nil).Msg("Nil context")
-
-	// Using a nil variable
 	var nilCtx context.Context
-	log.Info().Ctx(nilCtx).Msg("Nil context variable - technically has Ctx() call")
+	log.Info().Ctx(nilCtx).Msg("nil context value - should NOT trigger")
 }
 
 // TestGlobalLogger tests global logger patterns
@@ -281,7 +315,37 @@ func TestGlobalLoggers() {
 	// Global logger with context in call
 	globalLogger.Info().Ctx(ctx).Msg("Global logger with context in call")
 
-	// Global logger with embedded context
-	// Analyzer won't track this because it's a global var, not a local assignment
-	globalLoggerWithContext.Info().Msg("Global logger with embedded context - will likely trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	// Global logger with embedded context — tracked via ValueSpec.
+	globalLoggerWithContext.Info().Msg("Global logger with embedded context - should NOT trigger")
+}
+
+// TestFindCtxFallback exercises the fallback path in findCtxInScope where no
+// variable named "ctx" is in scope. The analyzer should still emit a diagnostic
+// and the suggested fix should reference the non-"ctx" variable (reqCtx).
+func TestFindCtxFallback() {
+	reqCtx := context.Background()
+	log.Info().Msg("only reqCtx in scope - fallback path") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	log.Info().Ctx(reqCtx).Msg("reqCtx used correctly")
+}
+
+// getLoggerAndErr returns a logger and an error (multi-return helper for
+// TestTupleAssignment).
+func getLoggerAndErr() (zerolog.Logger, error) {
+	return zerolog.New(os.Stdout), nil
+}
+
+// TestTupleAssignment verifies that a multi-LHS single-RHS assignment (tuple
+// return) does not crash the analyzer. The assignment is skipped by the
+// tracker (documented known limitation), so the subsequent Msg() call
+// correctly triggers even when Ctx() is added inline.
+func TestTupleAssignment() {
+	ctx := context.Background()
+
+	// Multi-return: logger not tracked, so Info().Msg() triggers.
+	logger, err := getLoggerAndErr()
+	_ = err
+	logger.Info().Msg("tuple assign - not tracked, triggers") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+
+	// Explicit Ctx() on the Event still satisfies the check.
+	logger.Info().Ctx(ctx).Msg("tuple assign with inline Ctx - should NOT trigger")
 }

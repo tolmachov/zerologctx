@@ -2,6 +2,8 @@
 package zerologctx
 
 import (
+	"go/token"
+	"go/types"
 	"testing"
 
 	"golang.org/x/tools/go/analysis/analysistest"
@@ -14,14 +16,122 @@ func TestAnalyzer(t *testing.T) {
 	// Get the test data directory
 	testdata := analysistest.TestData()
 
-	// Run the analyzer on the test package
-	analysistest.Run(t, testdata, Analyzer, "testpkg")
+	// Run the analyzer on the test packages.
+	// logonlypkg exercises the importsZerolog sub-package branch
+	// (imports zerolog/log but not zerolog directly).
+	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg")
+}
+
+// TestIsContextType directly tests the isContextType method against synthetic
+// go/types constructs. This exercises cases that cannot be expressed in the
+// testdata fixtures because the stub's Ctx(context.Context) parameter rejects
+// non-context values at compile time.
+func TestIsContextType(t *testing.T) {
+	// Build a minimal context.Context interface: Deadline, Done, Err, Value.
+	pkg := types.NewPackage("ctxtest", "ctxtest")
+	emptySig := types.NewSignatureType(nil, nil, nil, nil, nil, false)
+
+	// Correct method signatures matching context.Context.
+	timePkg := types.NewPackage("time", "time")
+	timeType := types.NewNamed(types.NewTypeName(token.NoPos, timePkg, "Time", nil), types.NewStruct(nil, nil), nil)
+	deadlineSig := types.NewSignatureType(nil, nil, nil, nil,
+		types.NewTuple(
+			types.NewVar(token.NoPos, nil, "", timeType),
+			types.NewVar(token.NoPos, nil, "", types.Typ[types.Bool]),
+		), false)
+	doneSig := types.NewSignatureType(nil, nil, nil, nil,
+		types.NewTuple(types.NewVar(token.NoPos, nil, "", types.NewChan(types.RecvOnly, types.NewStruct(nil, nil)))),
+		false)
+	errSig := types.NewSignatureType(nil, nil, nil, nil,
+		types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("error").Type())),
+		false)
+	valueSig := types.NewSignatureType(nil, nil, nil,
+		types.NewTuple(types.NewVar(token.NoPos, nil, "key", types.Universe.Lookup("any").Type())),
+		types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("any").Type())),
+		false)
+
+	iface := types.NewInterfaceType([]*types.Func{
+		types.NewFunc(token.NoPos, pkg, "Deadline", deadlineSig),
+		types.NewFunc(token.NoPos, pkg, "Done", doneSig),
+		types.NewFunc(token.NoPos, pkg, "Err", errSig),
+		types.NewFunc(token.NoPos, pkg, "Value", valueSig),
+	}, nil)
+	iface.Complete()
+
+	st := &state{contextIface: iface}
+
+	// Helper to build a named struct type with the given methods.
+	namedWith := func(name string, methods ...*types.Func) *types.Named {
+		tn := types.NewNamed(types.NewTypeName(token.NoPos, pkg, name, nil), types.NewStruct(nil, nil), nil)
+		for _, m := range methods {
+			tn.AddMethod(m)
+		}
+		return tn
+	}
+
+	t.Run("nil contextIface returns false", func(t *testing.T) {
+		nilSt := &state{contextIface: nil}
+		if nilSt.isContextType(types.Typ[types.String]) {
+			t.Error("isContextType with nil contextIface should return false")
+		}
+	})
+
+	t.Run("nil type returns false", func(t *testing.T) {
+		if st.isContextType(nil) {
+			t.Error("isContextType(nil) should return false")
+		}
+	})
+
+	t.Run("map type returns false", func(t *testing.T) {
+		mapType := types.NewMap(types.Typ[types.String], types.Universe.Lookup("any").Type())
+		if st.isContextType(mapType) {
+			t.Error("map type should not satisfy context.Context")
+		}
+	})
+
+	t.Run("wrong method signatures returns false", func(t *testing.T) {
+		// Struct has correct method names but all return nothing (wrong signatures).
+		wrongType := namedWith("WrongCtx",
+			types.NewFunc(token.NoPos, pkg, "Deadline", emptySig),
+			types.NewFunc(token.NoPos, pkg, "Done", emptySig),
+			types.NewFunc(token.NoPos, pkg, "Err", emptySig),
+			types.NewFunc(token.NoPos, pkg, "Value", emptySig),
+		)
+		if st.isContextType(wrongType) {
+			t.Error("type with wrong method signatures should not satisfy context.Context")
+		}
+	})
+
+	t.Run("correct implementation returns true", func(t *testing.T) {
+		goodType := namedWith("GoodCtx",
+			types.NewFunc(token.NoPos, pkg, "Deadline", deadlineSig),
+			types.NewFunc(token.NoPos, pkg, "Done", doneSig),
+			types.NewFunc(token.NoPos, pkg, "Err", errSig),
+			types.NewFunc(token.NoPos, pkg, "Value", valueSig),
+		)
+		if !st.isContextType(goodType) {
+			t.Error("type with correct method signatures should satisfy context.Context")
+		}
+	})
+
+	t.Run("pointer to correct implementation returns true", func(t *testing.T) {
+		goodType := namedWith("GoodCtxPtr",
+			types.NewFunc(token.NoPos, pkg, "Deadline", deadlineSig),
+			types.NewFunc(token.NoPos, pkg, "Done", doneSig),
+			types.NewFunc(token.NoPos, pkg, "Err", errSig),
+			types.NewFunc(token.NoPos, pkg, "Value", valueSig),
+		)
+		if !st.isContextType(types.NewPointer(goodType)) {
+			t.Error("pointer to type with correct method signatures should satisfy context.Context")
+		}
+	})
 }
 
 // TestAnalyzerHelpers tests the helper functions used by the analyzer.
 func TestAnalyzerHelpers(t *testing.T) {
-	// Note: isContextType now requires *analysis.Pass and types.Type,
-	// so it's tested through the integration tests in TestAnalyzer instead.
+	// Note: isContextType is directly tested in TestIsContextType above with
+	// synthetic go/types constructs that cover negative cases not expressible
+	// in testdata fixtures.
 
 	// Test the isNoLintComment function
 	t.Run("isNoLintComment", func(t *testing.T) {
@@ -42,8 +152,15 @@ func TestAnalyzerHelpers(t *testing.T) {
 			{"//nolint:otherlinter", "zerologctx", false},
 			{"//nolint:linter1,linter2", "zerologctx", false},
 			{"// just a comment", "zerologctx", false},
-			{"//nolint", "zerologctx", false},  // missing colon
+			{"//nolint", "zerologctx", true},                       // bare nolint suppresses all linters
+			{"// nolint", "zerologctx", true},                      // bare nolint with leading space
+			{"//nolint:all", "zerologctx", true},                   // explicit all
+			{"//nolint:zerologctx // because", "zerologctx", true}, // trailing reason
+			{"//nolint:l1,zerologctx // because", "zerologctx", true},
 			{"//nolint:", "zerologctx", false}, // empty linter list
+			// Edge cases: malformed directives
+			{"//nolint:ZerolOGCTX", "zerologctx", false}, // case sensitive linter names
+			{"//nolint // reason without colon", "zerologctx", true}, // bare nolint is valid
 		}
 
 		for _, tc := range testCases {

@@ -61,13 +61,19 @@ zerologctx -v ./...
 
 ### With golangci-lint
 
-Add to your `.golangci.yml` configuration:
+#### golangci-lint v1 (custom plugin)
+
+Build the plugin and reference it from `.golangci.yml`:
+
+```bash
+go build -buildmode=plugin -o zerologctx.so ./plugin
+```
 
 ```yaml
 linters-settings:
   custom:
     zerologctx:
-      path: $(go env GOPATH)/bin/zerologctx
+      path: ./zerologctx.so
       description: Ensures zerolog events include context
       original-url: github.com/tolmachov/zerologctx
 
@@ -75,6 +81,15 @@ linters:
   enable:
     - zerologctx
 ```
+
+#### golangci-lint v2 (module plugin system)
+
+`golangci-lint` v2 replaced `linters-settings.custom` with the module plugin
+system, which requires linters to provide a `New() register.LinterPlugin`
+factory. The current `plugin/plugin.go` exports the v1
+`func GetAnalyzers() []*analysis.Analyzer` contract; v2 support is not yet
+provided. If you are on v2, run the analyzer as a standalone tool (see
+"Standalone" above) or open an issue requesting v2 plugin support.
 
 Then run:
 
@@ -102,9 +117,9 @@ jobs:
     - uses: actions/checkout@v3
     
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.26'
     
     - name: Install zerologctx linter
       run: go install github.com/tolmachov/zerologctx/cmd/zerologctx@latest
