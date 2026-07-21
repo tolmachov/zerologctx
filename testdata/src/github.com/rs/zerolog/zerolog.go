@@ -100,6 +100,12 @@ func (l Logger) Error() *Event {
 	return &Event{}
 }
 
+// Err creates an event whose level depends on err (error or info), matching
+// the real zerolog API where Err is an Event-producing Logger method.
+func (l Logger) Err(err error) *Event {
+	return &Event{}
+}
+
 // Debug creates a debug level event
 func (l Logger) Debug() *Event {
 	return &Event{}
@@ -125,9 +131,10 @@ func (l Logger) Log() *Event {
 	return &Event{}
 }
 
-// Print creates a print level event
-func (l Logger) Print() *Event {
-	return &Event{}
+// Print logs at debug level using fmt.Sprint-style arguments. Matches the
+// real zerolog API, where Print does NOT return an *Event.
+func (l Logger) Print(v ...interface{}) {
+	// No-op for testing
 }
 
 // WithLevel creates an event with a specific log level
@@ -135,7 +142,8 @@ func (l Logger) WithLevel(level Level) *Event {
 	return &Event{}
 }
 
-// Printf creates a printf level event
+// Printf logs at debug level using fmt.Sprintf-style arguments; it does not
+// return an *Event, matching the real zerolog API.
 func (l Logger) Printf(format string, v ...interface{}) {
 	// No-op for testing
 }
@@ -145,9 +153,10 @@ func (l Logger) Trace() *Event {
 	return &Event{}
 }
 
-// With returns a new logger with the given context
-func (l Logger) With() *Context {
-	return &Context{}
+// With returns a context builder for a child logger. The real zerolog API
+// returns Context by value.
+func (l Logger) With() Context {
+	return Context{}
 }
 
 // Level sets the logger level
@@ -163,17 +172,17 @@ func (l Logger) Output(w interface{}) Logger {
 // Context represents a zerolog context
 type Context struct{}
 
-// Logger returns a logger from the context
-func (c *Context) Logger() Logger {
+// Logger returns a logger from the context builder
+func (c Context) Logger() Logger {
 	return Logger{}
 }
 
-// Ctx adds context to the Context
-func (c *Context) Ctx(ctx context.Context) *Context {
+// Ctx adds context to the Context builder
+func (c Context) Ctx(ctx context.Context) Context {
 	return c
 }
 
-// Str adds a string field to the context
-func (c *Context) Str(key string, value string) *Context {
+// Str adds a string field to the context builder
+func (c Context) Str(key string, value string) Context {
 	return c
 }

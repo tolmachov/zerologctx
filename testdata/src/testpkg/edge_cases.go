@@ -33,7 +33,7 @@ func TestStructLoggers() {
 	}
 	// The analyzer tracks struct fields via SelectorExpr for assignments, but
 	// composite literal initialization bypasses handleAssign, so the field is
-	// not tracked here. This is a known limitation of the single-pass design.
+	// not tracked here. This is a documented known limitation.
 	appWithCtx.logger.Info().Msg("Composite literal not tracked") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
@@ -57,18 +57,20 @@ func TestFunctionLoggers() {
 	// This should NOT trigger - context added
 	getLogger().Info().Ctx(ctx).Msg("With context")
 
-	// Logger with embedded context from function
-	// The analyzer cannot infer context from function return values, only from visible
-	// variable declarations and assignments. This correctly triggers as a false positive.
+	// Logger with embedded context from function.
+	// The analyzer cannot infer context from function return values, only from
+	// visible variable declarations and assignments, so this is a known false
+	// positive: the diagnostic below is expected.
 	getLoggerWithContext(ctx).Info().Msg("Missing context from func return") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
 // TestInvalidContextType verifies that wrong-type arguments to Ctx() are
 // rejected by the Go type system before the linter even runs. The stub's
-// Ctx(ctx context.Context) signature now matches real zerolog, so passing a
-// string or untyped nil would be a compile error and is no longer testable
-// here. The defensive isContextType check in the analyzer is exercised
-// instead by the custom-context fixtures in custom_context.go.
+// Ctx(ctx context.Context) signature matches real zerolog, so passing a
+// non-context value such as a string would be a compile error. Untyped nil
+// does compile and gets a dedicated diagnostic — see reviewNilCtxArg in
+// regression_review.go. The defensive isContextType check in the analyzer is
+// exercised by the custom-context fixtures in custom_context.go.
 func TestInvalidContextType() {}
 
 // TestVariableChains tests more complex variable chains
@@ -181,8 +183,9 @@ func TestLogLevels() {
 	// WithLevel without context - should trigger
 	log.WithLevel(zerolog.InfoLevel).Msg("WithLevel without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 
-	// Print without context - should trigger
-	log.Print().Msg("Print without context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	// Note: Print is not exercised here — in the real zerolog API Print takes
+	// fmt.Sprint-style arguments and returns nothing, so Print().Msg() does
+	// not exist.
 
 	// With context - should NOT trigger
 	log.Trace().Ctx(ctx).Msg("Trace with context")
@@ -191,7 +194,6 @@ func TestLogLevels() {
 	log.Warn().Ctx(ctx).Msg("Warn with context")
 	log.Error().Ctx(ctx).Msg("Error with context")
 	log.WithLevel(zerolog.InfoLevel).Ctx(ctx).Msg("WithLevel with context")
-	log.Print().Ctx(ctx).Msg("Print with context")
 }
 
 // TestSampleMethod tests Sample() which might affect logging
@@ -228,11 +230,10 @@ func TestLogCtxIsLogger() {
 	log.Ctx(ctx).Info().Ctx(ctx).Msg("now correct - Ctx on the Event")
 }
 
-// TestCrossFunctionNameCollision is a regression test for the
-// loggersWithCtx/eventsWithCtx maps being keyed by *types.Object rather than
-// by identifier name. Two functions can both declare a variable named
-// `logger` (one with embedded context, one without) without one polluting
-// the other.
+// TestCrossFunctionNameCollision is a regression test for the facts table
+// being keyed by *types.Object rather than by identifier name. Two functions
+// can both declare a variable named `logger` (one with embedded context, one
+// without) without one polluting the other.
 func TestCrossFunctionNameCollision() {
 	// This function's `logger` has embedded context.
 	ctx := context.Background()
@@ -335,9 +336,10 @@ func getLoggerAndErr() (zerolog.Logger, error) {
 }
 
 // TestTupleAssignment verifies that a multi-LHS single-RHS assignment (tuple
-// return) does not crash the analyzer. The assignment is skipped by the
-// tracker (documented known limitation), so the subsequent Msg() call
-// correctly triggers even when Ctx() is added inline.
+// return) does not crash the analyzer. The tracker records factNone for
+// tuple-assignment targets (the RHS cannot be classified per target), so the
+// subsequent Msg() call correctly triggers; adding Ctx() inline still
+// satisfies the check.
 func TestTupleAssignment() {
 	ctx := context.Background()
 

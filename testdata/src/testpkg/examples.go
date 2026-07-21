@@ -144,7 +144,7 @@ func nolintDirectives() {
 	log.Warn().Msg("Multiple linters without zerologctx") //nolint:foo,bar,baz // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 
 	// Multi-line chain with nolint on the preceding line exercises the
-	// chainStartLine-1 branch in hasNoLintDirective.
+	// chainStart-1 branch in hasNoLintDirective.
 	//nolint:zerologctx
 	log.Info().
 		Str("key", "value").

@@ -17,9 +17,18 @@ func TestAnalyzer(t *testing.T) {
 	testdata := analysistest.TestData()
 
 	// Run the analyzer on the test packages.
-	// logonlypkg exercises the importsZerolog sub-package branch
-	// (imports zerolog/log but not zerolog directly).
-	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg")
+	// logonlypkg imports only a zerolog sub-package, wrapperconsumer reaches
+	// *zerolog.Event via a local wrapper without directly importing zerolog,
+	// and noctxpkg has neither zerolog nor "context" in its import graph and
+	// must be skipped without diagnostics or errors.
+	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrapperconsumer", "noctxpkg")
+}
+
+// TestSuggestedFixes verifies the suggested-fix output end-to-end: candidate
+// selection in findCtxInScope (ctx-name preference, nearest-preceding choice,
+// skipping uninitialized vars) and the TextEdit insertion point.
+func TestSuggestedFixes(t *testing.T) {
+	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "fixpkg")
 }
 
 // TestIsContextType directly tests the isContextType method against synthetic
@@ -159,8 +168,9 @@ func TestAnalyzerHelpers(t *testing.T) {
 			{"//nolint:l1,zerologctx // because", "zerologctx", true},
 			{"//nolint:", "zerologctx", false}, // empty linter list
 			// Edge cases: malformed directives
-			{"//nolint:ZerolOGCTX", "zerologctx", false}, // case sensitive linter names
+			{"//nolint:ZerolOGCTX", "zerologctx", false},             // case sensitive linter names
 			{"//nolint // reason without colon", "zerologctx", true}, // bare nolint is valid
+			{"/* nolint:zerologctx */", "zerologctx", false},         // block comments are not nolint directives
 		}
 
 		for _, tc := range testCases {

@@ -1,6 +1,6 @@
 // Package logonlypkg imports only github.com/rs/zerolog/log (the sub-package),
 // not github.com/rs/zerolog directly. This exercises the strings.HasPrefix
-// branch in importsZerolog that matches zerolog sub-package imports.
+// branch in scanImports that matches zerolog sub-package imports.
 package logonlypkg
 
 import (

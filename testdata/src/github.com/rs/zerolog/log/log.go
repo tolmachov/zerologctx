@@ -20,6 +20,11 @@ func Error() *zerolog.Event {
 	return &zerolog.Event{}
 }
 
+// Err creates an event whose level depends on err, matching the real API.
+func Err(err error) *zerolog.Event {
+	return &zerolog.Event{}
+}
+
 // Debug creates a debug level event
 func Debug() *zerolog.Event {
 	return &zerolog.Event{}
@@ -45,12 +50,14 @@ func Log() *zerolog.Event {
 	return &zerolog.Event{}
 }
 
-// Print creates a print level event
-func Print() *zerolog.Event {
-	return &zerolog.Event{}
+// Print logs at debug level using fmt.Sprint-style arguments. Matches the
+// real zerolog API, where Print does NOT return an *Event.
+func Print(v ...interface{}) {
+	// No-op for testing
 }
 
-// Printf creates a printf level event
+// Printf logs at debug level using fmt.Sprintf-style arguments; it does not
+// return an *Event, matching the real zerolog API.
 func Printf(format string, v ...interface{}) {
 	// No-op for testing
 }
@@ -60,9 +67,10 @@ func Trace() *zerolog.Event {
 	return &zerolog.Event{}
 }
 
-// With adds context to the global logger
-func With() *zerolog.Context {
-	return &zerolog.Context{}
+// With returns a context builder seeded from the global logger. The real
+// zerolog API returns Context by value.
+func With() zerolog.Context {
+	return zerolog.Context{}
 }
 
 // WithLevel creates an event from the global logger at the given level.
@@ -70,7 +78,9 @@ func WithLevel(level zerolog.Level) *zerolog.Event {
 	return Logger.WithLevel(level)
 }
 
-// Ctx returns a sub-logger with the context field
+// Ctx returns the Logger associated with ctx (a lookup); it does NOT attach
+// ctx to subsequently created events — the load-bearing distinction the
+// analyzer's builderHasCtx/eventHasCtx receiver checks preserve.
 func Ctx(ctx context.Context) *zerolog.Logger {
 	l := zerolog.Logger{}
 	return &l

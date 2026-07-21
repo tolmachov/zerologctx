@@ -44,7 +44,8 @@ func TestCustomContextPointer() {
 
 // crossFileCollisionVictim is declared in a different file from
 // TestCrossFunctionNameCollision (edge_cases.go) to verify that the
-// scope-keyed maps prevent cross-file, cross-function name collisions.
+// object-keyed facts table prevents cross-file, cross-function name
+// collisions.
 // The `logger` with embedded context in TestCrossFunctionNameCollision
 // must not suppress the diagnostic here.
 func crossFileCollisionVictim() {

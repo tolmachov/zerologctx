@@ -6,15 +6,42 @@
 //
 //   - .Ctx(ctx) directly in the Event chain:
 //     log.Info().Ctx(ctx).Msg("hi")
-//   - A logger built with embedded context:
+//   - A logger built with embedded context, including loggers derived from it
+//     via Logger-returning methods (With()...Logger(), Level(), Output(), ...):
 //     l := log.With().Ctx(ctx).Logger(); l.Info().Msg("hi")
-//   - Context propagated through Event variable assignments:
+//   - Context propagated through assignments and aliases of Event, Logger and
+//     zerolog.Context (builder) variables:
 //     e := log.Info().Ctx(ctx); e.Msg("hi")
+//   - A mutating statement on a tracked Event variable (zerolog Event methods
+//     mutate the receiver in place):
+//     e := log.Info(); e.Ctx(ctx); e.Msg("hi")
 //   - Custom context types satisfying context.Context (e.g. via embedding).
 //
-// A //nolint:zerologctx (or //nolint:all, or bare //nolint) comment on the
-// terminal-call line, the line above the chain, or with a trailing reason is
-// honoured.
+// A //nolint:zerologctx (or //nolint:all, or bare //nolint) comment is
+// honoured when it appears on one of the chain's own lines (from the chain
+// start through the line of the terminal method's name) or as a standalone
+// comment on the line immediately above the chain. An end-of-line comment
+// that belongs to the previous statement does not apply.
+//
+// # Known limitations
+//
+// The analysis is flow-insensitive and intra-package by design:
+//
+//   - An assignment inside a conditional branch is treated as unconditional:
+//     after `if cond { l = ctxLogger }` the analyzer assumes l has context.
+//   - Struct fields are tracked per field declaration, not per instance:
+//     `a.logger = ctxLogger` also marks `b.logger` for other values of the
+//     same struct type.
+//   - Composite-literal initialisation (`App{logger: ctxLogger}`) is not
+//     tracked.
+//   - Facts do not cross package boundaries (no analysis.Facts): an exported
+//     context-bearing logger declared in another package is not recognised.
+//   - Method values (`m := e.Msg; m("...")`) are not checked.
+//   - Loggers and Events returned by helper functions, and loggers received
+//     as function parameters, are not recognised; attach the context to the
+//     Event at the call site instead.
+//   - Only the canonical github.com/rs/zerolog import path is recognised;
+//     forks and copies vendored under other paths are not.
 package zerologctx
 
 import (
@@ -30,7 +57,7 @@ import (
 )
 
 // zerologPkgPath is the canonical import path of the zerolog library used
-// for type-identity checks against *zerolog.Event.
+// for type-identity checks against zerolog's Event, Logger and Context types.
 const zerologPkgPath = "github.com/rs/zerolog"
 
 // Analyzer is the zerologctx analyzer. See its Doc field for the user-facing
@@ -55,58 +82,127 @@ var terminalMethods = map[string]struct{}{
 	"Send":    {}, // log.Info().Send()
 }
 
-// logLevelMethods are zerolog.Logger methods that create an Event. They are
-// the entry points the analyzer walks past when tracing back from a terminal
-// call to its originating logger variable.
-var logLevelMethods = map[string]struct{}{
-	"Info":      {},
-	"Error":     {},
-	"Debug":     {},
-	"Warn":      {},
-	"Fatal":     {},
-	"Panic":     {},
-	"Trace":     {},
-	"Log":       {},
-	"Print":     {},
-	"WithLevel": {},
+// factKind describes what the analyzer knows about a tracked variable at a
+// given assignment site.
+type factKind uint8
+
+const (
+	// factNone: the variable was (re)assigned a value without context.
+	factNone factKind = iota
+	// factLoggerCtx: a zerolog.Logger with an embedded context.
+	factLoggerCtx
+	// factBuilderCtx: a zerolog.Context builder that has Ctx(ctx) applied.
+	factBuilderCtx
+	// factEventCtx: a *zerolog.Event with Ctx(ctx) somewhere upstream.
+	factEventCtx
+)
+
+// trackKindOf classifies a type as one of the zerolog value kinds the
+// analyzer records facts for, or trackNone for everything else.
+type trackKind uint8
+
+const (
+	trackNone trackKind = iota
+	trackLogger
+	trackEvent
+	trackBuilder
+)
+
+func trackKindOf(t types.Type) trackKind {
+	switch {
+	case isZerologLogger(t):
+		return trackLogger
+	case isZerologEvent(t):
+		return trackEvent
+	case isZerologContext(t):
+		return trackBuilder
+	}
+	return trackNone
 }
 
-// state holds the per-pass mutable analysis state. Centralising the maps and
-// pass reference avoids threading 3+ parameters through every helper and
-// gives one place to record/reset facts when behaviour evolves.
+// positiveFactFor maps a track category to the positive fact kind a variable
+// of that category may carry. The two enums stay in one-to-one correspondence
+// through this function, and factTable.set enforces it.
+func positiveFactFor(k trackKind) factKind {
+	switch k {
+	case trackLogger:
+		return factLoggerCtx
+	case trackEvent:
+		return factEventCtx
+	case trackBuilder:
+		return factBuilderCtx
+	}
+	return factNone
+}
+
+// maxFactPasses bounds the fact-collection fixpoint loop. Facts only move
+// from factNone to a positive kind (the predicates are monotone in the fact
+// table), so the loop terminates naturally; each pass resolves at least one
+// more link of an out-of-source-order dependency chain, and chains deeper
+// than this are reported by collectFacts as an error instead of silently
+// truncating the analysis into false positives.
+const maxFactPasses = 10
+
+// state holds the per-pass mutable analysis state.
 type state struct {
 	pass *analysis.Pass
 
-	// loggersWithCtx tracks variables (locals, parameters, package-level
-	// vars, struct fields) whose value is a zerolog Logger that already has
-	// a context embedded. Keyed by *types.Object so different bindings with
-	// the same name in different scopes do not collide.
-	loggersWithCtx map[types.Object]bool
-
-	// eventsWithCtx tracks variables holding a *zerolog.Event chain that has
-	// a Ctx(ctx) call somewhere upstream.
-	eventsWithCtx map[types.Object]bool
-
-	// contextIface is the canonical context.Context interface, found by a
-	// recursive walk of the package's imports. May be nil if the package
-	// transitively does not import "context"; in that case isContextType
-	// returns false.
+	// contextIface is the canonical context.Context interface, found by
+	// scanImports. Non-nil whenever run() proceeds past its early exit.
 	contextIface *types.Interface
 
+	// facts records, per tracked variable (locals, parameters, package-level
+	// vars, struct fields), what was assigned at each source position. Keyed
+	// by *types.Object so different bindings with the same name in different
+	// scopes do not collide. See factTable for the lookup semantics.
+	facts *factTable
+
 	// fileMap maps token.Files to the *ast.File the analyzer should scan
-	// for nolint directives. Populated eagerly by buildFileMap before traversal
-	// begins; never nil after a successful run().
+	// for nolint directives. Populated eagerly by buildFileMap before
+	// traversal begins; never nil after a successful run().
 	fileMap map[*token.File]*ast.File
+
+	// commentIndex caches a per-file line→comments index for nolint lookups.
+	commentIndex map[*ast.File]map[int][]*ast.Comment
+
+	// srcCache caches file contents (possibly nil on read failure) used to
+	// distinguish standalone comments from end-of-line ones.
+	srcCache map[*token.File][]byte
+
+	// readErr holds the first pass.ReadFile failure encountered while
+	// classifying nolint comments. Surfaced by run() so a driver that cannot
+	// serve sources fails loudly instead of silently degrading the
+	// documented nolint semantics.
+	readErr error
+
+	// noInitVars caches the set of variables declared without an initializer
+	// (`var c context.Context`); such variables make poor suggested-fix
+	// candidates. Built lazily by noInitVarSet.
+	noInitVars map[types.Object]bool
 }
 
-// newState constructs a fresh analysis state for the given pass.
-func newState(pass *analysis.Pass) *state {
-	return &state{
-		pass:           pass,
-		loggersWithCtx: make(map[types.Object]bool),
-		eventsWithCtx:  make(map[types.Object]bool),
-		contextIface:   findContextInterface(pass.Pkg),
+// newState constructs a fresh analysis state for the given pass, including
+// the token.File→ast.File map used for nolint processing. Failing on a nil
+// token.File surfaces FileSet corruption immediately rather than silently
+// skipping files later, which would cause //nolint:zerologctx directives to
+// be unexpectedly ignored.
+func newState(pass *analysis.Pass, contextIface *types.Interface) (*state, error) {
+	s := &state{
+		pass:         pass,
+		contextIface: contextIface,
+		facts:        newFactTable(),
+		fileMap:      make(map[*token.File]*ast.File, len(pass.Files)),
+		commentIndex: make(map[*ast.File]map[int][]*ast.Comment),
+		srcCache:     make(map[*token.File][]byte),
 	}
+	for _, f := range pass.Files {
+		pf := pass.Fset.File(f.Pos())
+		if pf == nil {
+			return nil, fmt.Errorf("zerologctx: FileSet.File returned nil for %s; this indicates a corrupted FileSet", f.Name)
+		}
+		s.fileMap[pf] = f
+	}
+	return s, nil
 }
 
 // run is the analyzer entry point.
@@ -116,78 +212,201 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, fmt.Errorf("zerologctx: inspect.Analyzer result missing or wrong type")
 	}
 
-	// Skip packages that do not even import zerolog. This is the common case
-	// in monorepos and avoids walking the AST entirely for those packages.
-	if !importsZerolog(pass.Pkg) {
+	// Packages without zerolog in their transitive import graph have nothing
+	// to analyse — the common case in monorepos, and a silent skip by design.
+	hasZerolog, contextIface := scanImports(pass.Pkg)
+	if !hasZerolog {
 		return nil, nil
 	}
-
-	s := newState(pass)
-	// contextIface is always non-nil for packages that import zerolog, because
-	// zerolog itself transitively imports "context". This check guards against
-	// future zerolog API changes or unusual testdata stubs.
-	if s.contextIface == nil {
-		return nil, fmt.Errorf("zerologctx: could not locate context.Context interface in %s's import graph", pass.Pkg.Path())
+	// zerolog itself imports "context", so with zerolog present the interface
+	// must be discoverable. Failing to find it means the driver served an
+	// incomplete import graph; skipping silently here would disable the
+	// linter for a package that actively uses zerolog.
+	if contextIface == nil {
+		return nil, fmt.Errorf("zerologctx: could not locate context.Context in the import graph of %s", pass.Pkg.Path())
 	}
-	if err := s.buildFileMap(); err != nil {
+
+	s, err := newState(pass, contextIface)
+	if err != nil {
 		return nil, err
 	}
 
-	// Single-pass traversal: AssignStmt and ValueSpec nodes register loggers
-	// and Events that carry context; CallExpr nodes check terminal calls.
-	// Both kinds are visited in source order in one walk, so an Event used
-	// before its declaring assignment (e.g. via a closure) may not yet be
-	// registered when the terminal call is visited.
-	nodeFilter := []ast.Node{
-		(*ast.AssignStmt)(nil),
-		(*ast.ValueSpec)(nil),
-		(*ast.CallExpr)(nil),
+	// Phase A: collect context facts to a fixpoint.
+	if err := s.collectFacts(insp); err != nil {
+		return nil, err
 	}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
-		switch node := n.(type) {
-		case *ast.AssignStmt:
-			s.handleAssign(node)
-		case *ast.ValueSpec:
-			s.handleValueSpec(node)
-		case *ast.CallExpr:
-			s.handleCall(node)
-		}
+	// Phase B: check terminal calls.
+	insp.Preorder([]ast.Node{(*ast.CallExpr)(nil)}, func(n ast.Node) {
+		s.handleCall(n.(*ast.CallExpr))
 	})
 
+	// A failure to read sources degrades nolint classification (see
+	// isStandaloneComment); make it loud so a misconfigured driver is
+	// noticed instead of silently changing suppression semantics.
+	if s.readErr != nil {
+		return nil, fmt.Errorf("zerologctx: reading source for nolint processing: %w", s.readErr)
+	}
 	return nil, nil
 }
 
-// handleAssign records context-bearing loggers and events established by
-// short-var-decl (`:=`) or assignment (`=`). It also clears any prior fact
-// when a tracked variable is reassigned to a value without context, which
-// would otherwise produce false negatives.
-func (s *state) handleAssign(node *ast.AssignStmt) {
-	// Tuple assignments like `a, b := fn()` are not tracked; we cannot
-	// statically split a single multi-return into per-LHS facts.
-	if len(node.Rhs) == 1 && len(node.Lhs) > 1 {
-		return
+// collectFacts runs the fact-collection phase over assignments, var
+// declarations and mutating Event statements, repeated to a fixpoint so facts
+// that depend on other facts (aliases, package-level declarations in later
+// files) propagate regardless of source order. Hitting maxFactPasses means an
+// out-of-source-order dependency chain deeper than the cap (or a broken
+// monotonicity invariant after a future change); both must be loud, since a
+// silently truncated fact table produces baffling false positives.
+func (s *state) collectFacts(insp *inspector.Inspector) error {
+	factNodes := []ast.Node{
+		(*ast.AssignStmt)(nil),
+		(*ast.ValueSpec)(nil),
+		(*ast.ExprStmt)(nil),
 	}
-	if len(node.Lhs) != len(node.Rhs) {
-		return
-	}
-
-	for i, lhs := range node.Lhs {
-		obj := s.objectFromLHS(lhs)
-		if obj == nil {
-			continue
+	for range maxFactPasses {
+		s.facts.dirty = false
+		insp.Preorder(factNodes, func(n ast.Node) {
+			switch node := n.(type) {
+			case *ast.AssignStmt:
+				s.handleAssign(node)
+			case *ast.ValueSpec:
+				s.handleValueSpec(node)
+			case *ast.ExprStmt:
+				s.handleExprStmt(node)
+			}
+		})
+		if !s.facts.dirty {
+			return nil
 		}
-		s.recordRHS(obj, node.Rhs[i])
+	}
+	return fmt.Errorf("zerologctx: fact propagation did not converge after %d passes", maxFactPasses)
+}
+
+// scanImports walks pkg's transitive import graph once, reporting whether
+// zerolog (or one of its sub-packages, e.g. zerolog/log) is imported and
+// locating the standard library's context.Context interface. The walk stops
+// early once both are found.
+func scanImports(pkg *types.Package) (hasZerolog bool, contextIface *types.Interface) {
+	if pkg == nil {
+		return false, nil
+	}
+	seen := map[*types.Package]bool{}
+	var visit func(p *types.Package)
+	visit = func(p *types.Package) {
+		if p == nil || seen[p] || (hasZerolog && contextIface != nil) {
+			return
+		}
+		seen[p] = true
+		switch {
+		case p.Path() == zerologPkgPath || strings.HasPrefix(p.Path(), zerologPkgPath+"/"):
+			hasZerolog = true
+		case p.Path() == "context":
+			if obj := p.Scope().Lookup("Context"); obj != nil {
+				if iface, ok := obj.Type().Underlying().(*types.Interface); ok {
+					contextIface = iface
+				}
+			}
+		}
+		for _, imp := range p.Imports() {
+			visit(imp)
+		}
+	}
+	visit(pkg)
+	return hasZerolog, contextIface
+}
+
+// factTable records per-object, position-keyed context facts. Lookup follows
+// nearest-preceding-assignment semantics: the last assignment before the use
+// position wins, preserving source-order reassignment behaviour; when every
+// recorded assignment follows the use (a package-level var declared in a
+// later file, or a closure using a variable before its assignment site), the
+// earliest one is used as the best available approximation.
+type factTable struct {
+	entries map[types.Object]map[token.Pos]factKind
+
+	// dirty is set by set when a collection pass learns something new; the
+	// fixpoint loop in collectFacts stops when a full pass leaves it false.
+	dirty bool
+}
+
+func newFactTable() *factTable {
+	return &factTable{entries: make(map[types.Object]map[token.Pos]factKind)}
+}
+
+// set records what a tracked variable holds as of the given position. Writes
+// whose kind does not match the object's track category (the positiveFactFor
+// correspondence) are rejected: they would corrupt lookups that compare
+// against a specific kind.
+func (t *factTable) set(obj types.Object, pos token.Pos, kind factKind) {
+	if kind != factNone && kind != positiveFactFor(trackKindOf(obj.Type())) {
+		return
+	}
+	m := t.entries[obj]
+	if m == nil {
+		m = make(map[token.Pos]factKind)
+		t.entries[obj] = m
+	}
+	if old, ok := m[pos]; !ok || old != kind {
+		m[pos] = kind
+		t.dirty = true
 	}
 }
 
-// handleValueSpec records context-bearing loggers and events established by
-// `var` declarations (including package-level vars).
+// at returns what the table knows about obj at the given use position.
+func (t *factTable) at(obj types.Object, at token.Pos) factKind {
+	entries := t.entries[obj]
+	if len(entries) == 0 {
+		return factNone
+	}
+	nearest, earliest := factNone, factNone
+	var nearestPos, earliestPos token.Pos
+	haveNearest, haveEarliest := false, false
+	for p, k := range entries {
+		if !haveEarliest || p < earliestPos {
+			haveEarliest, earliestPos, earliest = true, p, k
+		}
+		if p < at && (!haveNearest || p > nearestPos) {
+			haveNearest, nearestPos, nearest = true, p, k
+		}
+	}
+	if haveNearest {
+		return nearest
+	}
+	return earliest
+}
+
+// handleAssign records facts established by `:=` and `=` assignments. A
+// tuple assignment (`a, b := fn()`) cannot be split into per-LHS facts, but
+// it still invalidates any previously recorded fact for its targets.
+func (s *state) handleAssign(node *ast.AssignStmt) {
+	if len(node.Lhs) != len(node.Rhs) {
+		for _, lhs := range node.Lhs {
+			s.clearIfTracked(lhs, node.Pos())
+		}
+		return
+	}
+	for i, lhs := range node.Lhs {
+		obj := s.objectFromExpr(lhs)
+		if obj == nil {
+			continue
+		}
+		s.recordRHS(obj, node.Pos(), node.Rhs[i])
+	}
+}
+
+// handleValueSpec records facts established by `var` declarations (including
+// package-level vars). A multi-value spec backed by a single call is treated
+// like a tuple assignment.
 func (s *state) handleValueSpec(node *ast.ValueSpec) {
 	if len(node.Values) == 0 {
 		return
 	}
 	if len(node.Names) != len(node.Values) {
+		for _, name := range node.Names {
+			if obj := s.pass.TypesInfo.Defs[name]; obj != nil && trackKindOf(obj.Type()) != trackNone {
+				s.facts.set(obj, node.Pos(), factNone)
+			}
+		}
 		return
 	}
 	for i, name := range node.Names {
@@ -195,45 +414,86 @@ func (s *state) handleValueSpec(node *ast.ValueSpec) {
 		if obj == nil {
 			continue
 		}
-		s.recordRHS(obj, node.Values[i])
+		s.recordRHS(obj, node.Pos(), node.Values[i])
 	}
 }
 
-// recordRHS classifies a right-hand-side expression and updates the maps for
-// the given target object. Reassignment to a value without context clears
-// any prior fact for the same object.
-func (s *state) recordRHS(obj types.Object, rhs ast.Expr) {
-	switch {
-	case s.isLoggerWithContext(rhs):
-		s.loggersWithCtx[obj] = true
-		delete(s.eventsWithCtx, obj)
-	case s.isEventWithContext(rhs):
-		s.eventsWithCtx[obj] = true
-		delete(s.loggersWithCtx, obj)
-	default:
-		// Reassignment to a non-context-bearing value: clear any prior fact.
-		delete(s.loggersWithCtx, obj)
-		delete(s.eventsWithCtx, obj)
+// handleExprStmt records the fact established by a mutating statement such as
+// `e.Ctx(ctx)`: zerolog Event methods mutate the receiver in place and return
+// it, so a discarded chain still attaches the context to the root variable.
+func (s *state) handleExprStmt(node *ast.ExprStmt) {
+	call, ok := ast.Unparen(node.X).(*ast.CallExpr)
+	if !ok {
+		return
 	}
+	if !isZerologEvent(s.pass.TypesInfo.TypeOf(call)) {
+		return
+	}
+	if !s.eventHasCtx(call, node.Pos()) {
+		return
+	}
+	root := s.chainRootObject(call)
+	if root == nil || trackKindOf(root.Type()) != trackEvent {
+		return
+	}
+	s.facts.set(root, node.Pos(), factEventCtx)
 }
 
-// objectFromLHS resolves the *types.Object for an assignment LHS. It handles
-// bare identifiers (locals, params, package vars) and struct-field selectors
-// (`s.logger`, `app.fields.logger`).
-func (s *state) objectFromLHS(lhs ast.Expr) types.Object {
-	switch x := lhs.(type) {
-	case *ast.Ident:
-		if obj := s.pass.TypesInfo.Defs[x]; obj != nil {
-			return obj
-		}
-		return s.pass.TypesInfo.ObjectOf(x)
-	case *ast.SelectorExpr:
-		if sel, ok := s.pass.TypesInfo.Selections[x]; ok {
-			return sel.Obj()
-		}
-		return s.pass.TypesInfo.ObjectOf(x.Sel)
+// recordRHS classifies a right-hand-side expression for the given target
+// object. Reassignment to a value without context records factNone, which
+// supersedes any earlier positive fact at later use positions.
+func (s *state) recordRHS(obj types.Object, pos token.Pos, rhs ast.Expr) {
+	tk := trackKindOf(obj.Type())
+	if tk == trackNone {
+		return
 	}
-	return nil
+	kind := factNone
+	if s.exprHasCtx(tk, rhs, pos) {
+		kind = positiveFactFor(tk)
+	}
+	s.facts.set(obj, pos, kind)
+}
+
+// exprHasCtx dispatches to the category-specific context predicate.
+func (s *state) exprHasCtx(tk trackKind, expr ast.Expr, at token.Pos) bool {
+	switch tk {
+	case trackLogger:
+		return s.loggerHasCtx(expr, at)
+	case trackEvent:
+		return s.eventHasCtx(expr, at)
+	case trackBuilder:
+		return s.builderHasCtx(expr, at)
+	}
+	return false
+}
+
+// clearIfTracked records factNone for an assignment target whose type the
+// analyzer tracks (used for tuple assignments, where the RHS value cannot be
+// classified per target).
+func (s *state) clearIfTracked(lhs ast.Expr, pos token.Pos) {
+	obj := s.objectFromExpr(lhs)
+	if obj == nil || trackKindOf(obj.Type()) == trackNone {
+		return
+	}
+	s.facts.set(obj, pos, factNone)
+}
+
+// chainRootObject walks a fluent call chain to its base expression and
+// resolves the variable it is rooted at, e.g. `e` for `e.Str("k","v").Ctx(c)`.
+// Returns nil when the base is not a plain identifier or field selector.
+func (s *state) chainRootObject(expr ast.Expr) types.Object {
+	for {
+		expr = ast.Unparen(expr)
+		call, ok := expr.(*ast.CallExpr)
+		if !ok {
+			return s.objectFromExpr(expr)
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return nil
+		}
+		expr = sel.X
+	}
 }
 
 // handleCall checks a CallExpr to see whether it is a terminal zerolog call
@@ -250,14 +510,24 @@ func (s *state) handleCall(node *ast.CallExpr) {
 	if recvType == nil || !isZerologEvent(recvType) {
 		return
 	}
-
-	hasCtx := s.hasCtxCallInChain(sel.X, true) ||
-		s.isEventFromLoggerWithContext(sel.X) ||
-		s.isEventFromVariableWithContext(sel.X)
-	if hasCtx {
+	if s.eventHasCtx(sel.X, node.Pos()) {
 		return
 	}
 	if s.hasNoLintDirective(node, sel.Sel.Pos()) {
+		return
+	}
+
+	// With the real zerolog API only an untyped nil can reach a Ctx() call
+	// without satisfying context.Context; give it a message that does not
+	// falsely claim the Ctx() call is missing.
+	if s.chainHasNonCtxArg(sel.X) {
+		s.pass.Report(analysis.Diagnostic{
+			Pos: node.Pos(),
+			Message: fmt.Sprintf(
+				"zerolog event calls Ctx() with a non-context argument before %s() - pass a context.Context for proper log correlation",
+				sel.Sel.Name,
+			),
+		})
 		return
 	}
 
@@ -281,20 +551,121 @@ func (s *state) handleCall(node *ast.CallExpr) {
 	s.pass.Report(diag)
 }
 
-// hasCtxCallInChain walks a fluent call chain looking for a Ctx(ctx) call
-// whose argument satisfies context.Context.
-//
-// If requireEventReceiver is true, only Ctx() calls whose receiver is a
-// *zerolog.Event are counted. This enforces the load-bearing distinction
-// between Event.Ctx(ctx) (which attaches context to the event) and
-// Logger.Ctx(ctx) (which retrieves a logger from a context and does NOT
-// attach context to subsequently created events).
-//
-// When requireEventReceiver is false the receiver is not checked, which is
-// appropriate inside a With()...Logger() chain where Ctx() is called on a
-// *zerolog.Context builder by construction.
-func (s *state) hasCtxCallInChain(expr ast.Expr, requireEventReceiver bool) bool {
+// eventHasCtx reports whether expr — an expression of type *zerolog.Event —
+// carries a context: via an inline Ctx(ctx) call in its chain, via a tracked
+// Event variable at its root, or by originating from a context-bearing
+// logger. The walk is type-driven, so every Event-producing Logger method
+// (Info, Error, Err, WithLevel, ...) is covered without a method whitelist.
+func (s *state) eventHasCtx(expr ast.Expr, at token.Pos) bool {
+	expr = ast.Unparen(expr)
+	if call, ok := expr.(*ast.CallExpr); ok {
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		recv := s.pass.TypesInfo.TypeOf(sel.X)
+		switch {
+		case isZerologEvent(recv):
+			// Event.Ctx(ctx) attaches the context. The Event-receiver check
+			// preserves the load-bearing distinction from Logger lookups like
+			// log.Ctx(ctx), which do NOT attach context to created events.
+			if sel.Sel.Name == "Ctx" && s.callArgIsContext(call) {
+				return true
+			}
+			return s.eventHasCtx(sel.X, at)
+		case isZerologLogger(recv):
+			return s.loggerHasCtx(sel.X, at)
+		}
+		return false
+	}
+	return s.factIs(expr, at, factEventCtx)
+}
+
+// loggerHasCtx reports whether expr — an expression of type zerolog.Logger or
+// *zerolog.Logger — has an embedded context: a With()...Ctx(ctx)...Logger()
+// construction chain, a tracked logger variable, or a Logger-returning
+// derivation (Level, Output, Sample, ...) of either.
+func (s *state) loggerHasCtx(expr ast.Expr, at token.Pos) bool {
+	expr = ast.Unparen(expr)
+	switch x := expr.(type) {
+	case *ast.StarExpr: // (*holder.Logger).Info()
+		return s.loggerHasCtx(x.X, at)
+	case *ast.UnaryExpr: // &logger
+		if x.Op == token.AND {
+			return s.loggerHasCtx(x.X, at)
+		}
+		return false
+	case *ast.CallExpr:
+		sel, ok := x.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		recv := s.pass.TypesInfo.TypeOf(sel.X)
+		switch {
+		case isZerologContext(recv):
+			// builder.Logger()
+			return s.builderHasCtx(sel.X, at)
+		case isZerologLogger(recv):
+			// Logger-to-Logger derivation keeps the embedded context.
+			return s.loggerHasCtx(sel.X, at)
+		}
+		return false
+	}
+	return s.factIs(expr, at, factLoggerCtx)
+}
+
+// builderHasCtx reports whether expr — an expression of type zerolog.Context
+// (the builder) — has Ctx(ctx) applied. The Context-receiver requirement on
+// the Ctx call is what keeps Logger lookups such as log.Ctx(ctx) or
+// zerolog.Ctx(ctx) from counting: their receiver is a package, not a builder.
+func (s *state) builderHasCtx(expr ast.Expr, at token.Pos) bool {
+	expr = ast.Unparen(expr)
+	if call, ok := expr.(*ast.CallExpr); ok {
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		recv := s.pass.TypesInfo.TypeOf(sel.X)
+		switch {
+		case isZerologContext(recv):
+			if sel.Sel.Name == "Ctx" && s.callArgIsContext(call) {
+				return true
+			}
+			return s.builderHasCtx(sel.X, at)
+		case isZerologLogger(recv):
+			// logger.With() — a builder seeded from the logger, inheriting
+			// its embedded context.
+			return s.loggerHasCtx(sel.X, at)
+		}
+		return false
+	}
+	return s.factIs(expr, at, factBuilderCtx)
+}
+
+// factIs reports whether expr resolves to a tracked variable whose fact at
+// the given position is exactly kind. Shared base case of the three
+// predicates, making the predicate↔fact-kind correspondence explicit.
+func (s *state) factIs(expr ast.Expr, at token.Pos, kind factKind) bool {
+	obj := s.objectFromExpr(expr)
+	return obj != nil && s.facts.at(obj, at) == kind
+}
+
+// callArgIsContext reports whether the call's first argument satisfies
+// context.Context.
+func (s *state) callArgIsContext(call *ast.CallExpr) bool {
+	if len(call.Args) == 0 {
+		return false
+	}
+	argType := s.pass.TypesInfo.TypeOf(call.Args[0])
+	return argType != nil && s.isContextType(argType)
+}
+
+// chainHasNonCtxArg reports whether the Event chain contains a Ctx() call on
+// an Event receiver whose argument does not satisfy context.Context (with the
+// real zerolog API this means an untyped nil).
+func (s *state) chainHasNonCtxArg(expr ast.Expr) bool {
 	for {
+		expr = ast.Unparen(expr)
 		call, ok := expr.(*ast.CallExpr)
 		if !ok {
 			return false
@@ -303,16 +674,8 @@ func (s *state) hasCtxCallInChain(expr ast.Expr, requireEventReceiver bool) bool
 		if !ok {
 			return false
 		}
-		if sel.Sel.Name == "Ctx" && len(call.Args) > 0 {
-			argType := s.pass.TypesInfo.TypeOf(call.Args[0])
-			if argType != nil && s.isContextType(argType) {
-				if !requireEventReceiver {
-					return true
-				}
-				if recvType := s.pass.TypesInfo.TypeOf(sel.X); recvType != nil && isZerologEvent(recvType) {
-					return true
-				}
-			}
+		if sel.Sel.Name == "Ctx" && isZerologEvent(s.pass.TypesInfo.TypeOf(sel.X)) && !s.callArgIsContext(call) {
+			return true
 		}
 		expr = sel.X
 	}
@@ -327,7 +690,8 @@ func (s *state) isContextType(typ types.Type) bool {
 	if types.Implements(typ, s.contextIface) {
 		return true
 	}
-	// Allow value-receiver types to satisfy via their pointer receiver as well.
+	// Also try the pointer type: a type whose methods use pointer receivers
+	// implements the interface only through *T.
 	if _, isPtr := typ.(*types.Pointer); !isPtr {
 		if types.Implements(types.NewPointer(typ), s.contextIface) {
 			return true
@@ -336,62 +700,10 @@ func (s *state) isContextType(typ types.Type) bool {
 	return false
 }
 
-// findContextInterface walks pkg's import graph (depth-first) looking for
-// the standard library's context.Context interface. Returns nil if context
-// is not transitively imported, in which case the analyzer cannot reason
-// about Ctx() arguments and treats them as non-context.
-func findContextInterface(pkg *types.Package) *types.Interface {
-	if pkg == nil {
-		return nil
-	}
-	seen := map[*types.Package]bool{}
-	var visit func(p *types.Package) *types.Interface
-	visit = func(p *types.Package) *types.Interface {
-		if p == nil || seen[p] {
-			return nil
-		}
-		seen[p] = true
-		if p.Path() == "context" {
-			if obj := p.Scope().Lookup("Context"); obj != nil {
-				if objType := obj.Type(); objType != nil {
-					if iface, ok := objType.Underlying().(*types.Interface); ok {
-						return iface
-					}
-				}
-			}
-		}
-		for _, imp := range p.Imports() {
-			if iface := visit(imp); iface != nil {
-				return iface
-			}
-		}
-		return nil
-	}
-	return visit(pkg)
-}
-
-// importsZerolog reports whether pkg directly imports the zerolog library.
-// Used to short-circuit the inspector pass for packages that cannot possibly
-// contain zerolog calls. Note: this checks only direct imports, not transitive
-// ones, so packages that re-export zerolog via a wrapper will not match.
-func importsZerolog(pkg *types.Package) bool {
-	if pkg == nil {
-		return false
-	}
-	for _, imp := range pkg.Imports() {
-		if imp.Path() == zerologPkgPath || strings.HasPrefix(imp.Path(), zerologPkgPath+"/") {
-			return true
-		}
-	}
-	return false
-}
-
-// isZerologEvent reports whether t is *zerolog.Event or zerolog.Event from
-// the canonical github.com/rs/zerolog package. This is the precise
-// replacement for the previous strings.Contains(typeString, "zerolog.Event")
-// shortcut, which would also match unrelated types like zerolog.EventMarshaler
-// or types in forks named similarly.
-func isZerologEvent(t types.Type) bool {
+// isZerologNamed reports whether t (or its pointer element) is the named type
+// zerologPkgPath.name. Comparing the defining package path avoids matching
+// similarly named types from forks or unrelated packages.
+func isZerologNamed(t types.Type, name string) bool {
 	if t == nil {
 		return false
 	}
@@ -406,102 +718,18 @@ func isZerologEvent(t types.Type) bool {
 	if obj == nil || obj.Pkg() == nil {
 		return false
 	}
-	return obj.Name() == "Event" && obj.Pkg().Path() == zerologPkgPath
+	return obj.Name() == name && obj.Pkg().Path() == zerologPkgPath
 }
 
-// isLoggerWithContext checks whether expr is a Logger constructor chain that
-// embeds a context, e.g. log.With().Ctx(ctx).Logger().
-func (s *state) isLoggerWithContext(expr ast.Expr) bool {
-	call, ok := expr.(*ast.CallExpr)
-	if !ok {
-		return false
-	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	if sel.Sel.Name != "Logger" {
-		return false
-	}
-	// Inside a With()...Logger() chain the Ctx() receiver is a
-	// *zerolog.Context by construction, so we don't enforce the receiver
-	// type — any Ctx(ctx) call counts.
-	return s.hasCtxCallInChain(sel.X, false)
-}
-
-// isEventFromLoggerWithContext walks the originating log-level call (Info,
-// Error, Print, ...) for an Event chain and reports whether the underlying
-// logger is one we previously recorded as carrying context. It supports both
-// bare identifiers and selector expressions (struct fields, package-qualified
-// loggers).
-func (s *state) isEventFromLoggerWithContext(expr ast.Expr) bool {
-	for expr != nil {
-		call, ok := expr.(*ast.CallExpr)
-		if !ok {
-			return false
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return false
-		}
-		if _, isLevel := logLevelMethods[sel.Sel.Name]; isLevel {
-			if obj := s.objectFromExpr(sel.X); obj != nil && s.loggersWithCtx[obj] {
-				return true
-			}
-		}
-		expr = sel.X
-	}
-	return false
-}
-
-// isEventWithContext reports whether expr is itself a *zerolog.Event chain
-// that already has context attached, either directly via Ctx() in the chain
-// or by referencing a tracked Event variable.
-func (s *state) isEventWithContext(expr ast.Expr) bool {
-	t := s.pass.TypesInfo.TypeOf(expr)
-	if t == nil || !isZerologEvent(t) {
-		return false
-	}
-	if s.hasCtxCallInChain(expr, true) {
-		return true
-	}
-	if s.isEventFromVariableWithContext(expr) {
-		return true
-	}
-	return false
-}
-
-// isEventFromVariableWithContext walks an Event chain looking for an
-// identifier or field reference that is registered in eventsWithCtx. This
-// enables propagation across assignments such as
-//
-//	e1 := log.Info().Ctx(ctx)
-//	e2 := e1.Str("k", "v")
-//	e2.Msg("...")
-func (s *state) isEventFromVariableWithContext(expr ast.Expr) bool {
-	for expr != nil {
-		if obj := s.objectFromExpr(expr); obj != nil {
-			if s.eventsWithCtx[obj] {
-				return true
-			}
-		}
-		call, ok := expr.(*ast.CallExpr)
-		if !ok {
-			return false
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return false
-		}
-		expr = sel.X
-	}
-	return false
-}
+func isZerologEvent(t types.Type) bool   { return isZerologNamed(t, "Event") }
+func isZerologLogger(t types.Type) bool  { return isZerologNamed(t, "Logger") }
+func isZerologContext(t types.Type) bool { return isZerologNamed(t, "Context") }
 
 // objectFromExpr resolves the *types.Object behind a bare identifier or a
-// selector expression (struct field). Returns nil for any other shape.
+// selector expression (struct field, package-qualified variable). Returns nil
+// for any other shape.
 func (s *state) objectFromExpr(expr ast.Expr) types.Object {
-	switch x := expr.(type) {
+	switch x := ast.Unparen(expr).(type) {
 	case *ast.Ident:
 		return s.pass.TypesInfo.ObjectOf(x)
 	case *ast.SelectorExpr:
@@ -514,10 +742,17 @@ func (s *state) objectFromExpr(expr ast.Expr) types.Object {
 }
 
 // hasNoLintDirective reports whether a //nolint comment suppressing
-// zerologctx applies to the given call. It accepts directives placed on the
-// terminal-method line (handles multi-line fluent chains where the chain
-// starts on an earlier line) or on the line immediately preceding the chain.
+// zerologctx applies to the given call: a directive on any of the chain's own
+// lines (chain start through the line of the terminal method's name, covering
+// both single-line calls and multi-line fluent chains), or a standalone
+// comment on the line immediately above the chain. An end-of-line comment
+// trailing the previous statement is deliberately not honoured — it belongs
+// to that statement.
 func (s *state) hasNoLintDirective(call *ast.CallExpr, terminalPos token.Pos) bool {
+	// Positions that cannot be matched to an analysed file (cgo-remapped
+	// positions are the only realistic case after newState verified the
+	// FileSet) fail open in the reporting direction: an extra diagnostic is
+	// recoverable noise, a silently honoured-or-dropped nolint is not.
 	tokFile := s.pass.Fset.File(call.Pos())
 	if tokFile == nil {
 		return false
@@ -527,45 +762,87 @@ func (s *state) hasNoLintDirective(call *ast.CallExpr, terminalPos token.Pos) bo
 		return false
 	}
 
+	chainStart := tokFile.Line(call.Pos())
 	terminalLine := tokFile.Line(terminalPos)
-	chainStartLine := tokFile.Line(call.Pos())
+	byLine := s.commentsByLine(astFile, tokFile)
 
-	for _, cg := range astFile.Comments {
-		for _, c := range cg.List {
-			commentLine := tokFile.Line(c.Pos())
-			// Accept directives on the terminal-method line (covers
-			// end-of-line directives on multi-line chains) or on the line
-			// immediately above the chain start.
-			if commentLine != terminalLine && commentLine != chainStartLine-1 {
-				continue
-			}
+	for line := chainStart; line <= terminalLine; line++ {
+		for _, c := range byLine[line] {
 			if isNoLintComment(c.Text, "zerologctx") {
 				return true
 			}
 		}
 	}
+	for _, c := range byLine[chainStart-1] {
+		if s.isStandaloneComment(tokFile, c) && isNoLintComment(c.Text, "zerologctx") {
+			return true
+		}
+	}
 	return false
 }
 
-// buildFileMap populates s.fileMap eagerly at the start of the analysis pass.
-// Returning an error here surfaces FileSet corruption immediately rather than
-// silently skipping files during nolint processing (which would cause
-// //nolint:zerologctx directives to be unexpectedly ignored).
-func (s *state) buildFileMap() error {
-	s.fileMap = make(map[*token.File]*ast.File, len(s.pass.Files))
-	for _, f := range s.pass.Files {
-		pf := s.pass.Fset.File(f.Pos())
-		if pf == nil {
-			return fmt.Errorf("zerologctx: FileSet.File returned nil for %s; this indicates a corrupted FileSet", f.Name)
-		}
-		s.fileMap[pf] = f
+// commentsByLine returns (building and caching on first use) a line-indexed
+// view of the file's comments, so each diagnostic checks only the handful of
+// lines it cares about instead of scanning every comment in the file.
+func (s *state) commentsByLine(astFile *ast.File, tokFile *token.File) map[int][]*ast.Comment {
+	if idx, ok := s.commentIndex[astFile]; ok {
+		return idx
 	}
-	return nil
+	idx := make(map[int][]*ast.Comment)
+	for _, cg := range astFile.Comments {
+		for _, c := range cg.List {
+			line := tokFile.Line(c.Pos())
+			idx[line] = append(idx[line], c)
+		}
+	}
+	s.commentIndex[astFile] = idx
+	return idx
+}
+
+// isStandaloneComment reports whether the comment is the first thing on its
+// line (only whitespace before it). When the source cannot be read the
+// comment is treated as standalone, erring on the side of honouring nolint.
+func (s *state) isStandaloneComment(tokFile *token.File, c *ast.Comment) bool {
+	src := s.sourceFor(tokFile)
+	if src == nil {
+		return true
+	}
+	line := tokFile.Line(c.Pos())
+	start := tokFile.Offset(tokFile.LineStart(line))
+	end := tokFile.Offset(c.Pos())
+	if start < 0 || end > len(src) || start > end {
+		return true
+	}
+	for _, b := range src[start:end] {
+		if b != ' ' && b != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+// sourceFor returns the file's contents, caching the result (including
+// failures, cached as nil) per token.File. The first read failure is kept in
+// s.readErr and surfaced by run(), so a driver that cannot serve sources is
+// noticed instead of silently falling back on nolint classification.
+func (s *state) sourceFor(tokFile *token.File) []byte {
+	if src, ok := s.srcCache[tokFile]; ok {
+		return src
+	}
+	src, err := s.pass.ReadFile(tokFile.Name())
+	if err != nil {
+		if s.readErr == nil {
+			s.readErr = err
+		}
+		src = nil
+	}
+	s.srcCache[tokFile] = src
+	return src
 }
 
 // fileFor returns the *ast.File for a token.File, or nil if the file is not
 // in the analysed set (e.g. an imported file whose positions happen to fall
-// in the same FileSet). buildFileMap must be called before fileFor.
+// in the same FileSet). newState populates fileMap before any use.
 func (s *state) fileFor(tf *token.File) *ast.File {
 	return s.fileMap[tf]
 }
@@ -600,7 +877,7 @@ func isNoLintComment(commentText, linterName string) bool {
 	if text == "" {
 		return false
 	}
-	for _, linter := range strings.Split(text, ",") {
+	for linter := range strings.SplitSeq(text, ",") {
 		l := strings.TrimSpace(linter)
 		if l == linterName || l == "all" {
 			return true
@@ -609,15 +886,38 @@ func isNoLintComment(commentText, linterName string) bool {
 	return false
 }
 
+// noInitVarSet returns (building lazily) the set of variables declared
+// without an initializer, e.g. `var c context.Context`. Suggesting such a
+// variable in a fix would insert a nil context.
+func (s *state) noInitVarSet() map[types.Object]bool {
+	if s.noInitVars != nil {
+		return s.noInitVars
+	}
+	s.noInitVars = make(map[types.Object]bool)
+	for _, f := range s.pass.Files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			vs, ok := n.(*ast.ValueSpec)
+			if !ok || len(vs.Values) != 0 {
+				return true
+			}
+			for _, name := range vs.Names {
+				if obj := s.pass.TypesInfo.Defs[name]; obj != nil {
+					s.noInitVars[obj] = true
+				}
+			}
+			return true
+		})
+	}
+	return s.noInitVars
+}
+
 // findCtxInScope searches the lexical scopes around pos for a variable that
-// satisfies context.Context. Variables literally named "ctx" are preferred;
-// otherwise the first matching variable found while walking outwards is
-// returned. Returns "", false if no candidate exists or if the package does
-// not import context.
+// satisfies context.Context, to power the suggested fix. Variables literally
+// named "ctx" are preferred; otherwise the nearest preceding candidate in the
+// innermost scope that has one is used. Package-level candidates are usable
+// regardless of declaration order. Variables declared without an initializer
+// are skipped. Returns "", false if no candidate exists.
 func (s *state) findCtxInScope(pos token.Pos) (string, bool) {
-	// contextIface is guaranteed non-nil by run()'s early-exit guard.
-	// This check is unreachable in normal operation but prevents a panic
-	// if findCtxInScope is ever called outside the run() flow.
 	if s.contextIface == nil {
 		return "", false
 	}
@@ -635,31 +935,47 @@ func (s *state) findCtxInScope(pos token.Pos) (string, bool) {
 	}
 	scope = scope.Innermost(pos)
 
-	var fallback string
+	noInit := s.noInitVarSet()
+	pkgScope := s.pass.Pkg.Scope()
+	usable := func(v *types.Var, sc *types.Scope) bool {
+		if noInit[v] || !s.isContextType(v.Type()) {
+			return false
+		}
+		// Package-level variables may be referenced regardless of their
+		// declaration order; locals only after their declaration.
+		return sc == pkgScope || v.Pos() < pos
+	}
+
+	fallback := ""
 	for sc := scope; sc != nil; sc = sc.Parent() {
-		// Prefer a variable literally named "ctx".
+		// Prefer a variable literally named "ctx", even from an outer scope.
 		if obj := sc.Lookup("ctx"); obj != nil {
-			if v, ok := obj.(*types.Var); ok && v.Pos() < pos && s.isContextType(v.Type()) {
+			if v, ok := obj.(*types.Var); ok && usable(v, sc) {
 				return "ctx", true
 			}
 		}
-		if fallback == "" {
-			for _, name := range sc.Names() {
-				obj := sc.Lookup(name)
-				v, ok := obj.(*types.Var)
-				if !ok {
-					continue
-				}
-				// Only consider variables declared before the diagnostic site
-				if v.Pos() >= pos {
-					continue
-				}
-				if s.isContextType(v.Type()) {
-					fallback = name
-					break
-				}
+		if fallback != "" {
+			continue
+		}
+		// Pick the nearest preceding candidate in this scope; fall back to
+		// any candidate for order-independent (package) scope.
+		var bestName string
+		var bestPos token.Pos
+		bestPreceding := false
+		for _, name := range sc.Names() {
+			v, ok := sc.Lookup(name).(*types.Var)
+			if !ok || !usable(v, sc) {
+				continue
+			}
+			preceding := v.Pos() < pos
+			switch {
+			case bestName == "",
+				preceding && !bestPreceding,
+				preceding == bestPreceding && preceding && v.Pos() > bestPos:
+				bestName, bestPos, bestPreceding = name, v.Pos(), preceding
 			}
 		}
+		fallback = bestName
 	}
 	if fallback != "" {
 		return fallback, true
