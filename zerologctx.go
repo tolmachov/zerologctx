@@ -17,6 +17,12 @@
 //     e := log.Info(); e.Ctx(ctx); e.Msg("hi")
 //   - Custom context types satisfying context.Context (e.g. via embedding).
 //
+// A diagnostic is emitted only when a context is actually available at the
+// call site — a context.Context-typed function parameter, a local variable
+// declared before the call, a package-level variable, or a field of the
+// enclosing method's receiver. Calls in code that has no context to pass are
+// not reported.
+//
 // A //nolint:zerologctx (or //nolint:all, or bare //nolint) comment is
 // honoured when it appears on one of the chain's own lines (from the chain
 // start through the line of the terminal method's name) or as a standalone
@@ -66,7 +72,11 @@ var Analyzer = &analysis.Analyzer{
 	Name: "zerologctx",
 	Doc: `Ensures zerolog events include context via the Ctx() method.
 This analyzer reports whenever a zerolog event uses terminal methods like
-Msg(), Msgf(), MsgFunc() or Send() without calling Ctx(ctx) first in the chain.`,
+Msg(), Msgf(), MsgFunc() or Send() without calling Ctx(ctx) first in the
+chain — but only when a context.Context is actually available at the call
+site: as a function parameter, a local variable declared before the call, a
+package-level variable, or a context-typed field of the method's receiver.
+Calls with no reachable context are not reported.`,
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
@@ -531,24 +541,28 @@ func (s *state) handleCall(node *ast.CallExpr) {
 		return
 	}
 
-	diag := analysis.Diagnostic{
+	// Report only when a context is actually available at the call site — as
+	// a scope variable or a receiver field. When there is nothing to pass,
+	// there is nothing to fix, so stay silent.
+	ctxName, ok := s.findCtxInScope(node.Pos())
+	if !ok {
+		return
+	}
+	s.pass.Report(analysis.Diagnostic{
 		Pos: node.Pos(),
 		Message: fmt.Sprintf(
 			"zerolog event missing .Ctx(ctx) before %s() - context should be included for proper log correlation",
 			sel.Sel.Name,
 		),
-	}
-	if ctxName, ok := s.findCtxInScope(node.Pos()); ok {
-		diag.SuggestedFixes = []analysis.SuggestedFix{{
+		SuggestedFixes: []analysis.SuggestedFix{{
 			Message: fmt.Sprintf("Insert .Ctx(%s) before %s()", ctxName, sel.Sel.Name),
 			TextEdits: []analysis.TextEdit{{
 				Pos:     sel.Sel.Pos(),
 				End:     sel.Sel.Pos(),
 				NewText: []byte("Ctx(" + ctxName + ")."),
 			}},
-		}}
-	}
-	s.pass.Report(diag)
+		}},
+	})
 }
 
 // eventHasCtx reports whether expr — an expression of type *zerolog.Event —
@@ -912,11 +926,15 @@ func (s *state) noInitVarSet() map[types.Object]bool {
 }
 
 // findCtxInScope searches the lexical scopes around pos for a variable that
-// satisfies context.Context, to power the suggested fix. Variables literally
-// named "ctx" are preferred; otherwise the nearest preceding candidate in the
-// innermost scope that has one is used. Package-level candidates are usable
-// regardless of declaration order. Variables declared without an initializer
-// are skipped. Returns "", false if no candidate exists.
+// satisfies context.Context. Its result decides both whether a missing-Ctx
+// diagnostic is reported at all (no candidate — no report) and which name the
+// suggested fix inserts. Variables literally named "ctx" are preferred;
+// otherwise the nearest preceding candidate in the innermost scope that has
+// one is used. Package-level candidates are usable regardless of declaration
+// order. Variables declared without an initializer are skipped. When no scope
+// variable qualifies, a context-typed field of the enclosing method's
+// receiver (as "recv.field") is used as a last resort. Returns "", false if
+// no candidate exists.
 func (s *state) findCtxInScope(pos token.Pos) (string, bool) {
 	if s.contextIface == nil {
 		return "", false
@@ -979,6 +997,47 @@ func (s *state) findCtxInScope(pos token.Pos) (string, bool) {
 	}
 	if fallback != "" {
 		return fallback, true
+	}
+	return s.receiverCtxField(astFile, pos)
+}
+
+// receiverCtxField looks for a context-typed field on the receiver of the
+// method enclosing pos and returns it as a "recv.field" selector. Calls
+// inside a FuncLit nested in a method still resolve to that method's
+// receiver. Only direct struct fields are considered, not fields promoted
+// from embedded structs; an embedded context.Context itself counts (as
+// "recv.Context").
+func (s *state) receiverCtxField(astFile *ast.File, pos token.Pos) (string, bool) {
+	for _, decl := range astFile.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Recv == nil || pos < fd.Pos() || pos >= fd.End() {
+			continue
+		}
+		if len(fd.Recv.List) != 1 || len(fd.Recv.List[0].Names) != 1 {
+			return "", false
+		}
+		recvIdent := fd.Recv.List[0].Names[0]
+		if recvIdent.Name == "_" {
+			return "", false
+		}
+		obj := s.pass.TypesInfo.Defs[recvIdent]
+		if obj == nil {
+			return "", false
+		}
+		t := obj.Type()
+		if ptr, ok := t.(*types.Pointer); ok {
+			t = ptr.Elem()
+		}
+		st, ok := t.Underlying().(*types.Struct)
+		if !ok {
+			return "", false
+		}
+		for f := range st.Fields() {
+			if s.isContextType(f.Type()) {
+				return recvIdent.Name + "." + f.Name(), true
+			}
+		}
+		return "", false
 	}
 	return "", false
 }

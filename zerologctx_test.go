@@ -19,9 +19,10 @@ func TestAnalyzer(t *testing.T) {
 	// Run the analyzer on the test packages.
 	// logonlypkg imports only a zerolog sub-package, wrapperconsumer reaches
 	// *zerolog.Event via a local wrapper without directly importing zerolog,
-	// and noctxpkg has neither zerolog nor "context" in its import graph and
-	// must be skipped without diagnostics or errors.
-	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrapperconsumer", "noctxpkg")
+	// noctxpkg has neither zerolog nor "context" in its import graph and
+	// must be skipped without diagnostics or errors, and scopepkg pins the
+	// context-availability gate (no reachable context — no diagnostic).
+	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrapperconsumer", "noctxpkg", "scopepkg")
 }
 
 // TestSuggestedFixes verifies the suggested-fix output end-to-end: candidate

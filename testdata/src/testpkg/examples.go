@@ -55,8 +55,9 @@ func correctUsage() {
 
 // incorrectUsage demonstrates patterns that should trigger the linter.
 func incorrectUsage() {
-	// Create context but deliberately don't use it in some logs
-	_ = context.Background()
+	// Create context but deliberately don't use it in the logs below.
+	ctx := context.Background()
+	_ = ctx
 
 	// Basic incorrect usage: Missing Ctx
 	log.Info().Msg("This is incorrect") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
@@ -97,6 +98,10 @@ func edgeCases() {
 
 // nolintDirectives demonstrates the use of nolint directives to suppress linter warnings
 func nolintDirectives() {
+	// A context is available so the non-nolint calls below are reported.
+	ctx := context.Background()
+	_ = ctx
+
 	// These log events are missing Ctx() but have nolint directives to suppress warnings
 
 	// Single line nolint directive

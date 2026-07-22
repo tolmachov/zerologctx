@@ -49,6 +49,8 @@ func TestCustomContextPointer() {
 // The `logger` with embedded context in TestCrossFunctionNameCollision
 // must not suppress the diagnostic here.
 func crossFileCollisionVictim() {
+	ctx := context.Background()
+	_ = ctx
 	logger := zerolog.New(os.Stdout)
 	logger.Info().Msg("cross-file victim - must trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }

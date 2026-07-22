@@ -132,6 +132,30 @@ jobs:
 
 This linter detects when zerolog events use terminal methods like `.Msg()`, `.Msgf()`, `.MsgFunc()`, or `.Send()` without first calling `.Ctx(ctx)` in the method chain.
 
+A diagnostic is emitted only when a context is actually available at the call site:
+
+- a `context.Context` function parameter,
+- a local variable declared **before** the call (a context created mid-function makes the calls after it require `.Ctx()`, while calls before it stay silent),
+- a package-level context variable,
+- a `context.Context`-typed field of the method's receiver (e.g. `s.ctx`).
+
+Code that has no context to pass is not reported:
+
+```go
+// ✅ Not flagged - there is no context anywhere in scope
+func startup() {
+    log.Info().Msg("initializing")
+}
+
+// The requirement kicks in once a context exists
+func process() {
+    log.Info().Msg("no context yet - not flagged")
+    ctx := context.Background()
+    log.Info().Msg("flagged - ctx is now available") // ❌
+    log.Info().Ctx(ctx).Msg("correct")               // ✅
+}
+```
+
 ### Important Distinction
 
 The linter correctly distinguishes between:

@@ -232,6 +232,8 @@ func reviewNilCtxMidChain() {
 // reviewVarTupleDecl: a multi-name var declaration backed by a single call is
 // treated like a tuple assignment — the logger is not tracked.
 func reviewVarTupleDecl() {
+	ctx := context.Background()
+	_ = ctx
 	var vlogger, verr = getLoggerAndErr()
 	_ = verr
 	vlogger.Info().Msg("var tuple declaration - must trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"

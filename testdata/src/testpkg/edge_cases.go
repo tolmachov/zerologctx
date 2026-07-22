@@ -244,6 +244,8 @@ func TestCrossFunctionNameCollision() {
 // crossCollisionVictim verifies that the `logger` declared in
 // TestCrossFunctionNameCollision above does not pollute this scope.
 func crossCollisionVictim() {
+	ctx := context.Background()
+	_ = ctx
 	logger := zerolog.New(os.Stdout)
 	logger.Info().Msg("MUST trigger - this logger does not have context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }

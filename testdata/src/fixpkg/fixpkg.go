@@ -33,3 +33,15 @@ func nearestPreceding(outer context.Context) {
 	_ = inner
 	log.Info().Msg("fix must insert inner") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
+
+// server carries a context field used as the fix candidate when no scope
+// variable is available.
+type server struct {
+	ctx context.Context
+}
+
+// receiverField: with no context variable in scope, the receiver's
+// context-typed field is inserted.
+func (s *server) receiverField() {
+	log.Info().Msg("fix must insert s.ctx") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+}

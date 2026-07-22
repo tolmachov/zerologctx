@@ -14,6 +14,6 @@ func correct() {
 	log.Info().Ctx(ctx).Msg("correct")
 }
 
-func incorrect() {
+func incorrect(ctx context.Context) {
 	log.Info().Msg("missing context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
