@@ -9,23 +9,33 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// App represents an application with a logger field
+// App represents an application with a logger field that is given a context
+// somewhere in this package.
 type App struct {
+	logger zerolog.Logger
+}
+
+// plainApp's logger field is never given a context anywhere in the package.
+// A dedicated type is what makes the diagnostic below independent of where the
+// other fixtures sit in the file: App.logger is a single fact shared by every
+// App value (see objectFromExpr), so one context-bearing App silences every
+// use of that field.
+type plainApp struct {
 	logger zerolog.Logger
 }
 
 // TestStructLoggers tests loggers stored in struct fields
 func TestStructLoggers() {
 	ctx := context.Background()
-	app := &App{
+	plain := &plainApp{
 		logger: zerolog.New(os.Stdout),
 	}
 
-	// This should trigger - logger from struct field without context
-	app.logger.Info().Msg("Missing context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	// This should trigger - a field logger that never carries a context
+	plain.logger.Info().Msg("Missing context") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 
-	// This should NOT trigger - context added
-	app.logger.Info().Ctx(ctx).Msg("With context")
+	// This should NOT trigger - context added at the call site
+	plain.logger.Info().Ctx(ctx).Msg("With context")
 
 	// Struct logger with embedded context via composite literal
 	appWithCtx := &App{
@@ -34,6 +44,16 @@ func TestStructLoggers() {
 	// Composite literal initialisation feeds the same per-field fact an
 	// `appWithCtx.logger = ...` assignment would, so this must NOT trigger.
 	appWithCtx.logger.Info().Msg("Composite literal is tracked")
+
+	// One fact per field declaration, not per instance: another App built
+	// without a context is covered by appWithCtx's fact regardless of which of
+	// the two literals comes first in the file. Ordering these by position
+	// would make the verdict depend on the order the constructors happen to be
+	// written in.
+	appPlain := &App{
+		logger: zerolog.New(os.Stdout),
+	}
+	appPlain.logger.Info().Msg("shared field fact - order-independent")
 }
 
 // getLogger returns a logger (function call)
@@ -230,7 +250,7 @@ func TestLogCtxIsLogger() {
 }
 
 // TestCrossFunctionNameCollision is a regression test for the facts table
-// being keyed by *types.Object rather than by identifier name. Two functions
+// being keyed by types.Object rather than by identifier name. Two functions
 // can both declare a variable named `logger` (one with embedded context, one
 // without) without one polluting the other.
 func TestCrossFunctionNameCollision() {
@@ -321,9 +341,11 @@ func TestGlobalLoggers() {
 	globalLoggerWithContext.Info().Msg("Global logger with embedded context - should NOT trigger")
 }
 
-// TestFindCtxFallback exercises the fallback path in findCtxInScope where no
-// variable named "ctx" is in scope. The analyzer should still emit a diagnostic
-// and the suggested fix should reference the non-"ctx" variable (reqCtx).
+// TestFindCtxFallback exercises reachableCtx's fallback path, where no
+// variable named "ctx" is in scope, so a differently named candidate has to be
+// found for the diagnostic to fire at all. The fix text itself is pinned by
+// fixpkg; this package runs through analysistest.Run, which compares
+// diagnostics only.
 func TestFindCtxFallback() {
 	reqCtx := context.Background()
 	log.Info().Msg("only reqCtx in scope - fallback path") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"

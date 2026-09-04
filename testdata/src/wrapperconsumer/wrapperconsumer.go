@@ -42,3 +42,13 @@ func derivedFromImported(ctx context.Context) {
 	l := wrappkg.CtxLogger.Level(0)
 	l.Info().Msg("derived from imported ctx logger - must not trigger")
 }
+
+// assignForeignVar: assigning to another package's exported logger records a
+// fact for an object this package does not own. exportCtxFacts must skip it —
+// ExportObjectFact panics on objects belonging to another package. The local
+// write does not change the verdict either, because a foreign object is
+// answered by its imported fact alone.
+func assignForeignVar(ctx context.Context) {
+	wrappkg.PlainLogger = wrappkg.CtxLogger
+	wrappkg.PlainLogger.Info().Msg("foreign assignment is not a local fact") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+}

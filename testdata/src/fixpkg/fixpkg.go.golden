@@ -38,6 +38,17 @@ func assignedAfterDeclaration() {
 	log.Info().Ctx(ctx).Msg("fix must insert ctx") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
+// addressTaken: a variable declared without an initializer whose address is
+// handed to another function may be assigned through that pointer, so it is
+// not treated as permanently nil.
+func addressTaken() {
+	var ctx context.Context
+	fillCtx(&ctx)
+	log.Info().Ctx(ctx).Msg("fix must insert ctx") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+}
+
+func fillCtx(dst *context.Context) { *dst = context.Background() }
+
 // nearestPreceding: the innermost scope's nearest preceding candidate wins
 // over an outer-scope parameter.
 func nearestPreceding(outer context.Context) {
