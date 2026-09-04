@@ -115,7 +115,7 @@ func reviewNilCtxArg() {
 // statement and must not suppress the diagnostic on the next line.
 func reviewNolintPreviousLineEOL() {
 	ctx := context.Background()
-	log.Info().Ctx(ctx).Msg("fine") //nolint:zerologctx
+	log.Info().Ctx(ctx).Msg("fine")                             //nolint:zerologctx
 	log.Info().Msg("previous line's EOL nolint does not apply") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 

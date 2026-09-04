@@ -4,9 +4,12 @@ package zerologctx
 import (
 	"go/token"
 	"go/types"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/tools/go/analysis/analysistest"
+	"golang.org/x/tools/go/packages"
 )
 
 // TestAnalyzer runs the analyzer against test cases in the testdata directory.
@@ -20,9 +23,11 @@ func TestAnalyzer(t *testing.T) {
 	// logonlypkg imports only a zerolog sub-package, wrapperconsumer reaches
 	// *zerolog.Event via a local wrapper without directly importing zerolog,
 	// noctxpkg has neither zerolog nor "context" in its import graph and
-	// must be skipped without diagnostics or errors, and scopepkg pins the
-	// context-availability gate (no reachable context — no diagnostic).
-	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrapperconsumer", "noctxpkg", "scopepkg")
+	// must be skipped without diagnostics or errors, scopepkg pins the
+	// context-availability gate (no reachable context — no diagnostic), and
+	// deepchainpkg pins fixpoint convergence for a dependency chain deeper
+	// than any fixed pass budget.
+	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrapperconsumer", "noctxpkg", "scopepkg", "deepchainpkg")
 }
 
 // TestSuggestedFixes verifies the suggested-fix output end-to-end: candidate
@@ -30,6 +35,48 @@ func TestAnalyzer(t *testing.T) {
 // skipping uninitialized vars) and the TextEdit insertion point.
 func TestSuggestedFixes(t *testing.T) {
 	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "fixpkg")
+}
+
+// TestSuggestedFixesCompile type-checks fixpkg.go.golden — the source
+// analysistest produces by applying every suggested fix — against the same
+// GOPATH-style testdata tree the analyzer runs on.
+//
+// TestSuggestedFixes only proves the fixed text is the text we expected; it
+// says nothing about whether that text compiles. Three separate classes of
+// broken fix (a candidate name shadowed at the call site, a value whose
+// context methods use pointer receivers, a blank receiver field) shipped
+// under a green golden comparison. Any fix that does not type-check now fails
+// here.
+func TestSuggestedFixesCompile(t *testing.T) {
+	testdata := analysistest.TestData()
+	fixed, err := os.ReadFile(filepath.Join(testdata, "src", "fixpkg", "fixpkg.go.golden"))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+			packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedDeps,
+		Dir: testdata,
+		// GOPATH mode, matching analysistest's own loader.
+		Env: append(os.Environ(), "GOPATH="+testdata, "GO111MODULE=off", "GOWORK=off"),
+		Overlay: map[string][]byte{
+			filepath.Join(testdata, "src", "fixpkg", "fixpkg.go"): fixed,
+		},
+	}
+	pkgs, err := packages.Load(cfg, "fixpkg")
+	if err != nil {
+		t.Fatalf("load fixpkg with suggested fixes applied: %v", err)
+	}
+	if len(pkgs) != 1 {
+		t.Fatalf("loaded %d packages, want 1", len(pkgs))
+	}
+	if pkgs[0].Name == "" {
+		t.Fatalf("fixpkg failed to load at all: %v", pkgs[0].Errors)
+	}
+	for _, e := range pkgs[0].Errors {
+		t.Errorf("source with suggested fixes applied does not compile: %v", e)
+	}
 }
 
 // TestIsContextType directly tests the isContextType method against synthetic

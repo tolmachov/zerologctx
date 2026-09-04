@@ -5,20 +5,7 @@ import (
 	"go/token"
 	"go/types"
 	"testing"
-
-	"golang.org/x/tools/go/analysis/analysistest"
 )
-
-// BenchmarkAnalyzer benchmarks the analyzer on the test cases.
-// This helps identify performance bottlenecks and track performance over time.
-func BenchmarkAnalyzer(b *testing.B) {
-	testdata := analysistest.TestData()
-	b.ResetTimer()
-
-	for b.Loop() {
-		analysistest.Run(b, testdata, Analyzer, "testpkg")
-	}
-}
 
 // BenchmarkIsNoLintComment benchmarks the nolint comment parsing function.
 func BenchmarkIsNoLintComment(b *testing.B) {

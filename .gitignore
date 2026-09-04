@@ -33,3 +33,6 @@ debug
 __debug_bin
 /zerologctx.bin
 /zerologctx
+
+# Serena MCP server workspace
+.serena/
