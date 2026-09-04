@@ -31,10 +31,9 @@ func TestStructLoggers() {
 	appWithCtx := &App{
 		logger: zerolog.New(os.Stdout).With().Ctx(ctx).Logger(),
 	}
-	// The analyzer tracks struct fields via SelectorExpr for assignments, but
-	// composite literal initialization bypasses handleAssign, so the field is
-	// not tracked here. This is a documented known limitation.
-	appWithCtx.logger.Info().Msg("Composite literal not tracked") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	// Composite literal initialisation feeds the same per-field fact an
+	// `appWithCtx.logger = ...` assignment would, so this must NOT trigger.
+	appWithCtx.logger.Info().Msg("Composite literal is tracked")
 }
 
 // getLogger returns a logger (function call)

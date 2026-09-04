@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug fixes
 
+- **Context-bearing loggers from other packages were reported.** The analysis
+  stopped at the package boundary, so an exported logger declared as
+  `var Default = log.With().Ctx(ctx).Logger()` in one package produced a
+  diagnostic on every use in another. The analyzer now exports a `ctxCarrier`
+  `analysis.Fact` for exported package-level variables and struct fields that
+  were assigned a context-bearing value, and honours it in importing packages.
+  Cross-package facts carry no position ordering, so any positive assignment
+  counts; an imported logger that never carries a context is still reported.
+- **Composite-literal initialisation was not tracked.** `&App{logger:
+  ctxLogger}` — the most natural way to give a struct a context-bearing
+  logger — produced a false positive on every use of that field. Keyed and
+  positional struct literals now feed the same per-field fact an assignment
+  does.
+
 - **Suggested fixes could produce code that does not compile.** The fix
   candidate was chosen by object and type, but the emitted text was a bare
   name that was never checked against what that name resolves to at the
@@ -70,6 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clears the prior context fact (previously the map was append-only).
 
 ### Features
+
+- The golangci-lint plugin is now a **v2 module plugin**
+  (`register.Plugin` in `github.com/tolmachov/zerologctx/plugin`). The v1
+  `GetAnalyzers` / `-buildmode=plugin` entry point is removed rather than kept
+  alongside it. As a side effect `go build ./...` works again: the plugin
+  package is no longer a `main` package without a `main` function. Settings
+  aimed at the linter are rejected instead of silently ignored, since it has
+  no configuration surface.
 
 - Diagnostics now include an `analysis.SuggestedFix` that inserts
   `.Ctx(ctx)` before the terminal method when an in-scope variable

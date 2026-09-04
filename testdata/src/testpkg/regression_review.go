@@ -6,6 +6,7 @@ package testpkg
 import (
 	"context"
 	"errors"
+	"os"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -237,4 +238,27 @@ func reviewVarTupleDecl() {
 	var vlogger, verr = getLoggerAndErr()
 	_ = verr
 	vlogger.Info().Msg("var tuple declaration - must trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+}
+
+// PositionalHolder pins positional (unkeyed) struct literal initialisation,
+// which resolves fields by index rather than by key.
+type PositionalHolder struct {
+	logger zerolog.Logger
+}
+
+// reviewPositionalCompositeLit: an unkeyed literal feeds the same per-field
+// fact a keyed one does.
+func reviewPositionalCompositeLit() {
+	ctx := context.Background()
+	h := PositionalHolder{log.With().Ctx(ctx).Logger()}
+	h.logger.Info().Msg("positional literal carries ctx - should NOT trigger")
+}
+
+// reviewPositionalCompositeLitNoCtx: and a plain logger leaves the field
+// untracked.
+func reviewPositionalCompositeLitNoCtx() {
+	ctx := context.Background()
+	_ = ctx
+	h := PositionalHolder{zerolog.New(os.Stdout)}
+	h.logger.Info().Msg("positional literal without ctx") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }

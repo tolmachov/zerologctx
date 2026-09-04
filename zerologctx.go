@@ -43,11 +43,9 @@
 //     after `if cond { l = ctxLogger }` the analyzer assumes l has context.
 //   - Struct fields are tracked per field declaration, not per instance:
 //     `a.logger = ctxLogger` also marks `b.logger` for other values of the
-//     same struct type.
-//   - Composite-literal initialisation (`App{logger: ctxLogger}`) is not
-//     tracked.
-//   - Facts do not cross package boundaries (no analysis.Facts): an exported
-//     context-bearing logger declared in another package is not recognised.
+//     same struct type. This is deliberate; see objectFromExpr.
+//   - Across package boundaries only exported objects carry facts, and only
+//     as "was ever assigned a context", without position ordering.
 //   - Method values (`m := e.Msg; m("...")`) are not checked.
 //   - Loggers and Events returned by helper functions, and loggers received
 //     as function parameters, are not recognised; attach the context to the
@@ -85,9 +83,23 @@ chain — but only when a context.Context is actually available at the call
 site: as a function parameter, a local variable declared before the call, a
 package-level variable, or a context-typed field of the method's receiver.
 Calls with no reachable context are not reported.`,
-	Requires: []*analysis.Analyzer{inspect.Analyzer},
-	Run:      run,
+	Requires:  []*analysis.Analyzer{inspect.Analyzer},
+	Run:       run,
+	FactTypes: []analysis.Fact{new(ctxCarrier)},
 }
+
+// ctxCarrier marks an object another package can name — an exported
+// package-level variable, or an exported field of a struct — as holding a
+// zerolog value with an embedded context. Without it the analysis would stop
+// at the package boundary and report every use of a logger that demonstrably
+// carries a context, which is the failure mode that gets a linter switched
+// off.
+type ctxCarrier struct{}
+
+// AFact marks ctxCarrier as an analysis fact.
+func (*ctxCarrier) AFact() {}
+
+func (*ctxCarrier) String() string { return "carries a context" }
 
 // terminalMethods are the *zerolog.Event methods that produce output and must
 // be preceded by Ctx() somewhere in the chain. Keep in sync with zerolog's
@@ -242,10 +254,12 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, err
 	}
 
-	// Phase A: collect context facts to a fixpoint.
+	// Phase A: collect context facts to a fixpoint, then publish the ones
+	// importing packages need.
 	if err := s.collectFacts(insp); err != nil {
 		return nil, err
 	}
+	s.exportCtxFacts()
 
 	// Phase B: check terminal calls.
 	insp.Preorder([]ast.Node{(*ast.CallExpr)(nil)}, func(n ast.Node) {
@@ -278,6 +292,7 @@ func (s *state) collectFacts(insp *inspector.Inspector) error {
 		(*ast.AssignStmt)(nil),
 		(*ast.ValueSpec)(nil),
 		(*ast.ExprStmt)(nil),
+		(*ast.CompositeLit)(nil),
 	}
 	for {
 		s.facts.dirty = false
@@ -289,6 +304,8 @@ func (s *state) collectFacts(insp *inspector.Inspector) error {
 				s.handleValueSpec(node)
 			case *ast.ExprStmt:
 				s.handleExprStmt(node)
+			case *ast.CompositeLit:
+				s.handleCompositeLit(node)
 			}
 		})
 		if s.facts.violation != nil {
@@ -296,6 +313,31 @@ func (s *state) collectFacts(insp *inspector.Inspector) error {
 		}
 		if !s.facts.dirty {
 			return nil
+		}
+	}
+}
+
+// exportCtxFacts publishes, for every object an importing package can name,
+// whether it was ever assigned a context-bearing value.
+//
+// The position-keyed nearest-preceding lookup used within a package has no
+// meaning across one: an importing package has no ordering relative to the
+// declarations it imports. Any positive assignment therefore counts. That
+// direction is chosen deliberately — the cost is missing a diagnostic on a
+// logger that sometimes carries a context, and the alternative is reporting
+// one that does.
+func (s *state) exportCtxFacts() {
+	for obj, entries := range s.facts.entries {
+		// ExportObjectFact accepts only objects owned by this package, and
+		// only exported ones are nameable from another package at all.
+		if obj.Pkg() != s.pass.Pkg || !obj.Exported() {
+			continue
+		}
+		for _, kind := range entries {
+			if kind != factNone {
+				s.pass.ExportObjectFact(obj, new(ctxCarrier))
+				break
+			}
 		}
 	}
 }
@@ -474,6 +516,56 @@ func (s *state) handleExprStmt(node *ast.ExprStmt) {
 		return
 	}
 	s.facts.set(root, node.Pos(), factEventCtx)
+}
+
+// handleCompositeLit records the facts established by struct literal field
+// initialisation, `App{logger: ctxLogger}`, in both keyed and positional form.
+// Without it, a logger installed at construction time — the most natural way
+// to give a struct a context-bearing logger — produced a false positive on
+// every use of that field.
+//
+// Fields are keyed by their declaration, exactly as an `app.logger = ...`
+// assignment is, so both forms feed the same fact. See the note on
+// objectFromExpr for why field facts are deliberately not per-instance.
+func (s *state) handleCompositeLit(node *ast.CompositeLit) {
+	typ := s.pass.TypesInfo.TypeOf(node)
+	if typ == nil {
+		return
+	}
+	st, ok := typ.Underlying().(*types.Struct)
+	if !ok {
+		return
+	}
+	for i, elt := range node.Elts {
+		field, value := s.compositeLitField(st, i, elt)
+		if field == nil {
+			continue
+		}
+		s.recordRHS(field, node.Pos(), value)
+	}
+}
+
+// compositeLitField resolves one composite-literal element to the field it
+// initialises and the expression it initialises it with. Returns a nil field
+// for anything it cannot resolve (a non-identifier key, a positional element
+// past the end of the struct).
+func (s *state) compositeLitField(st *types.Struct, i int, elt ast.Expr) (*types.Var, ast.Expr) {
+	kv, keyed := elt.(*ast.KeyValueExpr)
+	if !keyed {
+		if i >= st.NumFields() {
+			return nil, nil
+		}
+		return st.Field(i), elt
+	}
+	key, ok := kv.Key.(*ast.Ident)
+	if !ok {
+		return nil, nil
+	}
+	field, ok := s.pass.TypesInfo.ObjectOf(key).(*types.Var)
+	if !ok {
+		return nil, nil
+	}
+	return field, kv.Value
 }
 
 // recordRHS classifies a right-hand-side expression for the given target
@@ -692,9 +784,22 @@ func (s *state) builderHasCtx(expr ast.Expr, at token.Pos) bool {
 // factIs reports whether expr resolves to a tracked variable whose fact at
 // the given position is exactly kind. Shared base case of the three
 // predicates, making the predicate↔fact-kind correspondence explicit.
+//
+// For an object owned by another package the position-keyed table says
+// nothing, so the imported ctxCarrier fact answers instead. The local table is
+// still consulted afterwards, for the rare case of this package assigning to
+// another package's exported variable.
 func (s *state) factIs(expr ast.Expr, at token.Pos, kind factKind) bool {
 	obj := s.objectFromExpr(expr)
-	return obj != nil && s.facts.at(obj, at) == kind
+	if obj == nil {
+		return false
+	}
+	if obj.Pkg() != nil && obj.Pkg() != s.pass.Pkg &&
+		kind == positiveFactFor(trackKindOf(obj.Type())) &&
+		s.pass.ImportObjectFact(obj, new(ctxCarrier)) {
+		return true
+	}
+	return s.facts.at(obj, at) == kind
 }
 
 // callArgIsContext reports whether the call's first argument satisfies
@@ -801,6 +906,13 @@ func isZerologContext(t types.Type) bool { return isZerologNamed(t, "Context") }
 // objectFromExpr resolves the *types.Object behind a bare identifier or a
 // selector expression (struct field, package-qualified variable). Returns nil
 // for any other shape.
+//
+// A struct field resolves to its declaration, so `a.logger` and `b.logger`
+// share one fact. That is a deliberate choice, not an oversight: keying facts
+// per instance would break the dominant shape, where a constructor fills the
+// field on one variable and methods read it through their own receiver, which
+// is a different object. Trading that false negative for a false positive on
+// ordinary constructor code is the wrong direction for a linter.
 func (s *state) objectFromExpr(expr ast.Expr) types.Object {
 	switch x := ast.Unparen(expr).(type) {
 	case *ast.Ident:

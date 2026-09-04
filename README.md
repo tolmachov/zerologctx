@@ -61,41 +61,54 @@ zerologctx -v ./...
 
 ### With golangci-lint
 
-#### golangci-lint v1 (custom plugin)
+`zerologctx` is a golangci-lint **v2 module plugin**. golangci-lint builds a
+custom binary with the plugin linked in. The v1 `-buildmode=plugin` path is not
+supported: it required compiling against golangci-lint's exact toolchain and
+dependency versions, and v2 replaced it.
 
-Build the plugin and reference it from `.golangci.yml`:
-
-```bash
-go build -buildmode=plugin -o zerologctx.so ./plugin
-```
+1. Declare the plugin in `.custom-gcl.yml`, next to your `go.mod`:
 
 ```yaml
-linters-settings:
-  custom:
-    zerologctx:
-      path: ./zerologctx.so
-      description: Ensures zerolog events include context
-      original-url: github.com/tolmachov/zerologctx
+version: v2.13.2
+name: golangci-lint-zerologctx
+plugins:
+  - module: github.com/tolmachov/zerologctx
+    import: github.com/tolmachov/zerologctx/plugin
+    version: v0.1.0
+```
 
+The `import` line is required. Registration lives in the `plugin` subpackage so
+that importing the analyzer as a library does not drag in golangci-lint's
+plugin registry.
+
+2. Build the custom binary:
+
+```bash
+golangci-lint custom
+```
+
+3. Enable the linter in `.golangci.yml`:
+
+```yaml
+version: "2"
 linters:
   enable:
     - zerologctx
+  settings:
+    custom:
+      zerologctx:
+        type: module
+        description: Ensures zerolog events include context via Ctx()
 ```
 
-#### golangci-lint v2 (module plugin system)
-
-`golangci-lint` v2 replaced `linters-settings.custom` with the module plugin
-system, which requires linters to provide a `New() register.LinterPlugin`
-factory. The current `plugin/plugin.go` exports the v1
-`func GetAnalyzers() []*analysis.Analyzer` contract; v2 support is not yet
-provided. If you are on v2, run the analyzer as a standalone tool (see
-"Standalone" above) or open an issue requesting v2 plugin support.
-
-Then run:
+4. Run the binary produced in step 2:
 
 ```bash
-golangci-lint run
+./golangci-lint-zerologctx run
 ```
+
+The analyzer has no settings. Supplying any is an error rather than a silent
+no-op, so a stale or typo'd configuration block is reported instead of ignored.
 
 ### In CI/CD Pipelines
 
@@ -138,6 +151,15 @@ A diagnostic is emitted only when a context is actually available at the call si
 - a local variable declared **before** the call (a context created mid-function makes the calls after it require `.Ctx()`, while calls before it stay silent),
 - a package-level context variable,
 - a `context.Context`-typed field of the method's receiver (e.g. `s.ctx`).
+
+A reachable context that cannot be *named* at the call site — because a local
+declaration shadows it — is still reported, but without a suggested fix, since
+inserting the name would reference the shadowing declaration instead.
+
+Context-bearing loggers are recognised across package boundaries: an exported
+package-level logger or an exported struct field that was assigned a logger
+with an embedded context is published as an analysis fact and honoured by
+importing packages.
 
 Code that has no context to pass is not reported:
 
@@ -275,17 +297,22 @@ log.Info().Msg("message") //nolint:zerologctx,anotherlinter
 
 ### VS Code
 
-Add to your `.vscode/settings.json`:
+The stock `golangci-lint` binary knows nothing about custom plugins, so point
+the Go extension at the binary produced by `golangci-lint custom`:
 
 ```json
 {
   "go.lintTool": "golangci-lint",
-  "go.lintFlags": [
-    "--fast",
-    "--enable=zerologctx"
-  ]
+  "go.alternateTools": {
+    "golangci-lint": "${workspaceFolder}/golangci-lint-zerologctx"
+  }
 }
 ```
+
+The linter is enabled through `.golangci.yml`, so no extra flags are needed.
+
+Alternatively, run the standalone binary directly — see the GoLand recipe
+below, which works the same way in any editor that can run a command on save.
 
 ### GoLand/IntelliJ IDEA
 
@@ -294,6 +321,22 @@ Add to your `.vscode/settings.json`:
    - Program: `$GoBinDirs$/zerologctx`
    - Arguments: `$FilePath$`
    - Working directory: `$ProjectFileDir$`
+
+## Limitations
+
+The analysis is flow-insensitive by design, which keeps it quiet rather than
+noisy:
+
+- An assignment inside a conditional branch counts as unconditional.
+- Struct fields are tracked per field declaration, not per instance, so
+  `a.logger = ctxLogger` also covers `b.logger`. This is deliberate: keying
+  facts per instance would report the common shape where a constructor fills
+  the field on one variable and methods read it through their own receiver.
+- Across package boundaries only exported objects carry facts, and only as
+  "was ever assigned a context", without position ordering.
+- Loggers and events returned by helper functions, or received as parameters,
+  are not recognised; attach the context to the event at the call site.
+- Only the canonical `github.com/rs/zerolog` import path is recognised.
 
 ## Contributing
 
