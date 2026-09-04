@@ -15,6 +15,8 @@
 //   - A mutating statement on a tracked Event variable (zerolog Event methods
 //     mutate the receiver in place):
 //     e := log.Info(); e.Ctx(ctx); e.Msg("hi")
+//   - Struct fields initialised by a composite literal, keyed or positional:
+//     app := &App{logger: log.With().Ctx(ctx).Logger()}
 //   - Custom context types satisfying context.Context (e.g. via embedding).
 //
 // A diagnostic is emitted only when a context is actually reachable at the
@@ -43,9 +45,13 @@
 //     after `if cond { l = ctxLogger }` the analyzer assumes l has context.
 //   - Struct fields are tracked per field declaration, not per instance:
 //     `a.logger = ctxLogger` also marks `b.logger` for other values of the
-//     same struct type. This is deliberate; see objectFromExpr.
+//     same struct type. This is deliberate; see objectFromExpr. For the same
+//     reason a field, like a package-level variable, is context-bearing if any
+//     assignment to it carries a context, rather than by source order.
 //   - Across package boundaries only exported objects carry facts, and only
-//     as "was ever assigned a context", without position ordering.
+//     as "was ever assigned a context", without position ordering. A fact
+//     cannot be published for another package's variable assigned here, so
+//     `other.Logger = ctxLogger` is invisible to a third package.
 //   - Method values (`m := e.Msg; m("...")`) are not checked.
 //   - Loggers and Events returned by helper functions, and loggers received
 //     as function parameters, are not recognised; attach the context to the
@@ -112,21 +118,6 @@ var terminalMethods = map[string]struct{}{
 	"Send":    {}, // log.Info().Send()
 }
 
-// factKind describes what the analyzer knows about a tracked variable at a
-// given assignment site.
-type factKind uint8
-
-const (
-	// factNone: the variable was (re)assigned a value without context.
-	factNone factKind = iota
-	// factLoggerCtx: a zerolog.Logger with an embedded context.
-	factLoggerCtx
-	// factBuilderCtx: a zerolog.Context builder that has Ctx(ctx) applied.
-	factBuilderCtx
-	// factEventCtx: a *zerolog.Event with Ctx(ctx) somewhere upstream.
-	factEventCtx
-)
-
 // trackKindOf classifies a type as one of the zerolog value kinds the
 // analyzer records facts for, or trackNone for everything else.
 type trackKind uint8
@@ -150,21 +141,6 @@ func trackKindOf(t types.Type) trackKind {
 	return trackNone
 }
 
-// positiveFactFor maps a track category to the positive fact kind a variable
-// of that category may carry. The two enums stay in one-to-one correspondence
-// through this function, and factTable.set enforces it.
-func positiveFactFor(k trackKind) factKind {
-	switch k {
-	case trackLogger:
-		return factLoggerCtx
-	case trackEvent:
-		return factEventCtx
-	case trackBuilder:
-		return factBuilderCtx
-	}
-	return factNone
-}
-
 // state holds the per-pass mutable analysis state.
 type state struct {
 	pass *analysis.Pass
@@ -175,7 +151,7 @@ type state struct {
 
 	// facts records, per tracked variable (locals, parameters, package-level
 	// vars, struct fields), what was assigned at each source position. Keyed
-	// by *types.Object so different bindings with the same name in different
+	// by types.Object so different bindings with the same name in different
 	// scopes do not collide. See factTable for the lookup semantics.
 	facts *factTable
 
@@ -192,23 +168,28 @@ type state struct {
 	srcCache map[*token.File][]byte
 
 	// readErr holds the first pass.ReadFile failure encountered while
-	// classifying nolint comments. Surfaced by run() so a driver that cannot
-	// serve sources fails loudly instead of silently degrading the
-	// documented nolint semantics.
-	readErr error
+	// classifying nolint comments, and readErrFile the file it happened on.
+	// Surfaced by run() so a driver that cannot serve sources fails loudly
+	// instead of silently degrading the documented nolint semantics.
+	readErr     error
+	readErrFile string
 
-	// nilVars caches the set of variables that can only ever hold nil: declared
-	// without an initializer and never assigned anywhere in the package. They
-	// are neither fix candidates nor evidence that a context is reachable.
-	// Built lazily by nilVarSet.
-	nilVars map[types.Object]bool
+	// nilCtxVars caches the set of context variables that can only ever hold
+	// nil: declared without an initializer and never assigned anywhere in the
+	// package. They are neither fix candidates nor evidence that a context is
+	// reachable. Built lazily by nilCtxVarSet.
+	nilCtxVars map[types.Object]bool
 }
 
 // newState constructs a fresh analysis state for the given pass, including
-// the token.File→ast.File map used for nolint processing. Failing on a nil
-// token.File surfaces FileSet corruption immediately rather than silently
-// skipping files later, which would cause //nolint:zerologctx directives to
-// be unexpectedly ignored.
+// the token.File→ast.File map used for nolint processing.
+//
+// Both per-file checks fail the pass rather than skipping the file, because
+// each silently disables a documented behaviour: a nil token.File means
+// //nolint:zerologctx directives would be ignored, and a missing file scope
+// means reachableCtx — the gate for every diagnostic — would answer "no
+// context anywhere" and the analyzer would report nothing at all while
+// exiting successfully.
 func newState(pass *analysis.Pass, contextIface *types.Interface) (*state, error) {
 	s := &state{
 		pass:         pass,
@@ -223,6 +204,9 @@ func newState(pass *analysis.Pass, contextIface *types.Interface) (*state, error
 		if pf == nil {
 			return nil, fmt.Errorf("zerologctx: FileSet.File returned nil for %s; this indicates a corrupted FileSet", f.Name)
 		}
+		if pass.TypesInfo.Scopes[f] == nil {
+			return nil, fmt.Errorf("zerologctx: no scope recorded for %s; the driver did not populate types.Info.Scopes, which the context-availability check requires", pf.Name())
+		}
 		s.fileMap[pf] = f
 	}
 	return s, nil
@@ -235,8 +219,12 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, fmt.Errorf("zerologctx: inspect.Analyzer result missing or wrong type")
 	}
 
-	// Packages without zerolog in their transitive import graph have nothing
-	// to analyse — the common case in monorepos, and a silent skip by design.
+	// Packages without zerolog in their transitive import graph have nothing to
+	// analyse — the common case in monorepos, and a silent skip by design. The
+	// asymmetry with the loud contextIface check below is deliberate: zerolog
+	// types can only reach this package through the same import graph, so if
+	// the walk does not find zerolog there is nothing here to report on,
+	// whereas finding zerolog without context.Context is a contradiction.
 	hasZerolog, contextIface := scanImports(pass.Pkg)
 	if !hasZerolog {
 		return nil, nil
@@ -256,9 +244,7 @@ func run(pass *analysis.Pass) (any, error) {
 
 	// Phase A: collect context facts to a fixpoint, then publish the ones
 	// importing packages need.
-	if err := s.collectFacts(insp); err != nil {
-		return nil, err
-	}
+	s.collectFacts(insp)
 	s.exportCtxFacts()
 
 	// Phase B: check terminal calls.
@@ -270,7 +256,7 @@ func run(pass *analysis.Pass) (any, error) {
 	// isStandaloneComment); make it loud so a misconfigured driver is
 	// noticed instead of silently changing suppression semantics.
 	if s.readErr != nil {
-		return nil, fmt.Errorf("zerologctx: reading source for nolint processing: %w", s.readErr)
+		return nil, fmt.Errorf("zerologctx: reading %s for nolint processing: %w", s.readErrFile, s.readErr)
 	}
 	return nil, nil
 }
@@ -280,14 +266,12 @@ func run(pass *analysis.Pass) (any, error) {
 // that depend on other facts (aliases, package-level declarations in later
 // files) propagate regardless of source order.
 //
-// The loop needs no pass budget: the fact lattice is finite (one entry per
-// tracked object and assignment position) and every write ascends it, so a
-// pass that changes nothing ends the loop and a pass that changes something
-// has consumed one of finitely many ascents. A dependency chain running
-// against the traversal order resolves one link per pass, however deep it is.
-// The only way this could spin is a future predicate that is not monotone in
-// the fact table, and factTable.set detects that directly.
-func (s *state) collectFacts(insp *inspector.Inspector) error {
+// The loop needs no pass budget. The fact lattice is finite — one entry per
+// tracked object and assignment position — and factTable.set only ever ascends
+// it, so each pass either changes nothing and ends the loop or consumes one of
+// finitely many ascents. A dependency chain running against the traversal
+// order resolves one link per pass, however deep it is.
+func (s *state) collectFacts(insp *inspector.Inspector) {
 	factNodes := []ast.Node{
 		(*ast.AssignStmt)(nil),
 		(*ast.ValueSpec)(nil),
@@ -295,7 +279,7 @@ func (s *state) collectFacts(insp *inspector.Inspector) error {
 		(*ast.CompositeLit)(nil),
 	}
 	for {
-		s.facts.dirty = false
+		before := s.facts.writes
 		insp.Preorder(factNodes, func(n ast.Node) {
 			switch node := n.(type) {
 			case *ast.AssignStmt:
@@ -308,17 +292,15 @@ func (s *state) collectFacts(insp *inspector.Inspector) error {
 				s.handleCompositeLit(node)
 			}
 		})
-		if s.facts.violation != nil {
-			return s.facts.violation
-		}
-		if !s.facts.dirty {
-			return nil
+		if s.facts.writes == before {
+			return
 		}
 	}
 }
 
-// exportCtxFacts publishes, for every object an importing package can name,
-// whether it was ever assigned a context-bearing value.
+// exportCtxFacts publishes a fact for every object an importing package can
+// name that was ever assigned a context-bearing value. There is no negative
+// fact: absence means "not known to carry a context".
 //
 // The position-keyed nearest-preceding lookup used within a package has no
 // meaning across one: an importing package has no ordering relative to the
@@ -328,13 +310,16 @@ func (s *state) collectFacts(insp *inspector.Inspector) error {
 // one that does.
 func (s *state) exportCtxFacts() {
 	for obj, entries := range s.facts.entries {
-		// ExportObjectFact accepts only objects owned by this package, and
-		// only exported ones are nameable from another package at all.
+		// ExportObjectFact panics on objects this package does not own, which
+		// assigning to another package's exported variable puts in the table.
+		// Exported() is a name test, not a scope test — a capitalised local
+		// passes it — but such a fact has no object path and is dropped when
+		// the driver encodes it, so the filter only needs to be cheap.
 		if obj.Pkg() != s.pass.Pkg || !obj.Exported() {
 			continue
 		}
-		for _, kind := range entries {
-			if kind != factNone {
+		for _, hasCtx := range entries {
+			if hasCtx {
 				s.pass.ExportObjectFact(obj, new(ctxCarrier))
 				break
 			}
@@ -375,77 +360,102 @@ func scanImports(pkg *types.Package) (hasZerolog bool, contextIface *types.Inter
 	return hasZerolog, contextIface
 }
 
-// factTable records per-object, position-keyed context facts. Lookup follows
-// nearest-preceding-assignment semantics: the last assignment before the use
-// position wins, preserving source-order reassignment behaviour; when every
-// recorded assignment follows the use (a package-level var declared in a
-// later file, or a closure using a variable before its assignment site), the
-// earliest one is used as the best available approximation.
+// factTable records, per tracked object, which assignment positions leave it
+// holding a context.
+//
+// Lookup has two regimes, because a source position means different things for
+// different objects:
+//
+//   - Locals and parameters (positionOrdered): the nearest preceding
+//     assignment wins, preserving reassignment order within a function body.
+//     When every recorded assignment follows the use — a closure reading a
+//     variable before its assignment site — the earliest is the best available
+//     approximation.
+//   - Struct fields and package-level variables: any context-bearing
+//     assignment wins. These are written and read from unrelated places, so
+//     ordering them by source position would make the verdict depend on which
+//     constructor happens to be written first in the file. This is the same
+//     rule exportCtxFacts applies across package boundaries.
 type factTable struct {
-	entries map[types.Object]map[token.Pos]factKind
+	entries map[types.Object]map[token.Pos]bool
 
-	// dirty is set by set when a collection pass learns something new; the
-	// fixpoint loop in collectFacts stops when a full pass leaves it false.
-	dirty bool
-
-	// violation holds the first non-monotone rewrite seen by set. It can only
-	// be reached by a predicate that regressed a fact, which would also be the
-	// only way to make the collectFacts loop spin; surfacing it as an error
-	// keeps that a loud bug report rather than a hang.
-	violation error
+	// writes counts effective writes. It only ever grows, so collectFacts can
+	// detect "this pass changed nothing" by comparing it before and after,
+	// with no flag to reset — and therefore no way to forget to reset one and
+	// leave the fixpoint loop spinning.
+	writes int
 }
 
 func newFactTable() *factTable {
-	return &factTable{entries: make(map[types.Object]map[token.Pos]factKind)}
+	return &factTable{entries: make(map[types.Object]map[token.Pos]bool)}
 }
 
-// set records what a tracked variable holds as of the given position. Writes
-// whose kind does not match the object's track category (the positiveFactFor
-// correspondence) are rejected: they would corrupt lookups that compare
-// against a specific kind.
-//
-// Facts only ascend: a positive kind may supersede factNone at the same
-// position, never the reverse. That is what makes collectFacts terminate, so a
-// rewrite that breaks it is recorded instead of applied.
-func (t *factTable) set(obj types.Object, pos token.Pos, kind factKind) {
-	if kind != factNone && kind != positiveFactFor(trackKindOf(obj.Type())) {
-		return
+// positionOrdered reports whether nearest-preceding-assignment lookup is
+// meaningful for obj. It is for locals and parameters, whose assignments and
+// uses are ordered inside one function body. It is not for struct fields
+// (which have no scope) or package-level variables, whose writers and readers
+// sit in unrelated functions.
+func positionOrdered(obj types.Object) bool {
+	v, ok := obj.(*types.Var)
+	if !ok || v.Pkg() == nil {
+		return false
 	}
+	parent := v.Parent()
+	return parent != nil && parent != v.Pkg().Scope()
+}
+
+// set records whether obj holds a context as of pos.
+//
+// Writes at one position join (logical or) rather than overwrite, because
+// token.Pos does not uniquely identify a write site: Go allows the same
+// assignment target twice in one statement (`l, l = ctxLogger, plain`), and an
+// ExprStmt shares its position with a composite literal it starts with
+// (`H{e: log.Info()}.e.Ctx(ctx)`). Treating a same-position collision as
+// impossible turned both of those into a hard analyzer error on legal code.
+// "Carries a context" is the right answer for a collision the analyzer cannot
+// order, being the direction that stays silent.
+//
+// Joining also makes the table ascend monotonically by construction, which is
+// what lets collectFacts iterate to a fixpoint with no pass budget.
+func (t *factTable) set(obj types.Object, pos token.Pos, hasCtx bool) {
 	m := t.entries[obj]
 	if m == nil {
-		m = make(map[token.Pos]factKind)
+		m = make(map[token.Pos]bool)
 		t.entries[obj] = m
 	}
-	switch old, ok := m[pos]; {
-	case ok && old == kind:
-		return
-	case ok && old != factNone:
-		if t.violation == nil {
-			t.violation = fmt.Errorf(
-				"zerologctx: internal invariant broken: fact for %q regressed from kind %d to %d; the fact lattice is no longer monotone",
-				obj.Name(), old, kind)
-		}
+	old, seen := m[pos]
+	next := old || hasCtx
+	if seen && next == old {
 		return
 	}
-	m[pos] = kind
-	t.dirty = true
+	m[pos] = next
+	t.writes++
 }
 
-// at returns what the table knows about obj at the given use position.
-func (t *factTable) at(obj types.Object, at token.Pos) factKind {
+// hasCtx reports what the table knows about obj at the given use position.
+func (t *factTable) hasCtx(obj types.Object, at token.Pos) bool {
 	entries := t.entries[obj]
 	if len(entries) == 0 {
-		return factNone
+		return false
 	}
-	nearest, earliest := factNone, factNone
+	if !positionOrdered(obj) {
+		for _, ctx := range entries {
+			if ctx {
+				return true
+			}
+		}
+		return false
+	}
+
+	nearest, earliest := false, false
 	var nearestPos, earliestPos token.Pos
 	haveNearest, haveEarliest := false, false
-	for p, k := range entries {
+	for p, ctx := range entries {
 		if !haveEarliest || p < earliestPos {
-			haveEarliest, earliestPos, earliest = true, p, k
+			haveEarliest, earliestPos, earliest = true, p, ctx
 		}
 		if p < at && (!haveNearest || p > nearestPos) {
-			haveNearest, nearestPos, nearest = true, p, k
+			haveNearest, nearestPos, nearest = true, p, ctx
 		}
 	}
 	if haveNearest {
@@ -454,9 +464,10 @@ func (t *factTable) at(obj types.Object, at token.Pos) factKind {
 	return earliest
 }
 
-// handleAssign records facts established by `:=` and `=` assignments. A
-// tuple assignment (`a, b := fn()`) cannot be split into per-LHS facts, but
-// it still invalidates any previously recorded fact for its targets.
+// handleAssign records facts established by `:=` and `=` assignments. A tuple
+// assignment (`a, b := fn()`) cannot be split into per-LHS facts, so it records
+// a contextless fact at its own position, which supersedes earlier facts for
+// uses after it without disturbing uses before it.
 func (s *state) handleAssign(node *ast.AssignStmt) {
 	if len(node.Lhs) != len(node.Rhs) {
 		for _, lhs := range node.Lhs {
@@ -483,7 +494,7 @@ func (s *state) handleValueSpec(node *ast.ValueSpec) {
 	if len(node.Names) != len(node.Values) {
 		for _, name := range node.Names {
 			if obj := s.pass.TypesInfo.Defs[name]; obj != nil && trackKindOf(obj.Type()) != trackNone {
-				s.facts.set(obj, node.Pos(), factNone)
+				s.facts.set(obj, node.Pos(), false)
 			}
 		}
 		return
@@ -515,7 +526,7 @@ func (s *state) handleExprStmt(node *ast.ExprStmt) {
 	if root == nil || trackKindOf(root.Type()) != trackEvent {
 		return
 	}
-	s.facts.set(root, node.Pos(), factEventCtx)
+	s.facts.set(root, node.Pos(), true)
 }
 
 // handleCompositeLit records the facts established by struct literal field
@@ -576,11 +587,7 @@ func (s *state) recordRHS(obj types.Object, pos token.Pos, rhs ast.Expr) {
 	if tk == trackNone {
 		return
 	}
-	kind := factNone
-	if s.exprHasCtx(tk, rhs, pos) {
-		kind = positiveFactFor(tk)
-	}
-	s.facts.set(obj, pos, kind)
+	s.facts.set(obj, pos, s.exprHasCtx(tk, rhs, pos))
 }
 
 // exprHasCtx dispatches to the category-specific context predicate.
@@ -604,7 +611,7 @@ func (s *state) clearIfTracked(lhs ast.Expr, pos token.Pos) {
 	if obj == nil || trackKindOf(obj.Type()) == trackNone {
 		return
 	}
-	s.facts.set(obj, pos, factNone)
+	s.facts.set(obj, pos, false)
 }
 
 // chainRootObject walks a fluent call chain to its base expression and
@@ -717,7 +724,7 @@ func (s *state) eventHasCtx(expr ast.Expr, at token.Pos) bool {
 		}
 		return false
 	}
-	return s.factIs(expr, at, factEventCtx)
+	return s.factIs(expr, at, trackEvent)
 }
 
 // loggerHasCtx reports whether expr — an expression of type zerolog.Logger or
@@ -750,7 +757,7 @@ func (s *state) loggerHasCtx(expr ast.Expr, at token.Pos) bool {
 		}
 		return false
 	}
-	return s.factIs(expr, at, factLoggerCtx)
+	return s.factIs(expr, at, trackLogger)
 }
 
 // builderHasCtx reports whether expr — an expression of type zerolog.Context
@@ -778,28 +785,26 @@ func (s *state) builderHasCtx(expr ast.Expr, at token.Pos) bool {
 		}
 		return false
 	}
-	return s.factIs(expr, at, factBuilderCtx)
+	return s.factIs(expr, at, trackBuilder)
 }
 
-// factIs reports whether expr resolves to a tracked variable whose fact at
-// the given position is exactly kind. Shared base case of the three
-// predicates, making the predicate↔fact-kind correspondence explicit.
+// factIs reports whether expr resolves to a tracked variable of category tk
+// that carries a context at the given position. Shared base case of the three
+// predicates; the tk check is what keeps a Logger fact from answering an Event
+// question, which is the correspondence the three predicates rely on.
 //
-// For an object owned by another package the position-keyed table says
-// nothing, so the imported ctxCarrier fact answers instead. The local table is
-// still consulted afterwards, for the rare case of this package assigning to
-// another package's exported variable.
-func (s *state) factIs(expr ast.Expr, at token.Pos, kind factKind) bool {
+// For an object owned by another package the local table says nothing — this
+// package never saw its assignments — so the imported ctxCarrier fact answers
+// instead.
+func (s *state) factIs(expr ast.Expr, at token.Pos, tk trackKind) bool {
 	obj := s.objectFromExpr(expr)
-	if obj == nil {
+	if obj == nil || trackKindOf(obj.Type()) != tk {
 		return false
 	}
-	if obj.Pkg() != nil && obj.Pkg() != s.pass.Pkg &&
-		kind == positiveFactFor(trackKindOf(obj.Type())) &&
-		s.pass.ImportObjectFact(obj, new(ctxCarrier)) {
-		return true
+	if obj.Pkg() != nil && obj.Pkg() != s.pass.Pkg {
+		return s.pass.ImportObjectFact(obj, new(ctxCarrier))
 	}
-	return s.facts.at(obj, at) == kind
+	return s.facts.hasCtx(obj, at)
 }
 
 // callArgIsContext reports whether the call's first argument satisfies
@@ -903,7 +908,7 @@ func isZerologEvent(t types.Type) bool   { return isZerologNamed(t, "Event") }
 func isZerologLogger(t types.Type) bool  { return isZerologNamed(t, "Logger") }
 func isZerologContext(t types.Type) bool { return isZerologNamed(t, "Context") }
 
-// objectFromExpr resolves the *types.Object behind a bare identifier or a
+// objectFromExpr resolves the types.Object behind a bare identifier or a
 // selector expression (struct field, package-qualified variable). Returns nil
 // for any other shape.
 //
@@ -934,10 +939,11 @@ func (s *state) objectFromExpr(expr ast.Expr) types.Object {
 // trailing the previous statement is deliberately not honoured — it belongs
 // to that statement.
 func (s *state) hasNoLintDirective(call *ast.CallExpr, terminalPos token.Pos) bool {
-	// Positions that cannot be matched to an analysed file (cgo-remapped
+	// Positions that cannot be matched to an analysed file — cgo-remapped
 	// positions are the only realistic case after newState verified the
-	// FileSet) fail open in the reporting direction: an extra diagnostic is
-	// recoverable noise, a silently honoured-or-dropped nolint is not.
+	// FileSet — are treated as carrying no directive. reachableCtx bails out on
+	// the same conditions, so such a call ends up silent rather than reported;
+	// what this avoids is honouring or dropping a nolint by guesswork.
 	tokFile := s.pass.Fset.File(call.Pos())
 	if tokFile == nil {
 		return false
@@ -1017,7 +1023,7 @@ func (s *state) sourceFor(tokFile *token.File) []byte {
 	src, err := s.pass.ReadFile(tokFile.Name())
 	if err != nil {
 		if s.readErr == nil {
-			s.readErr = err
+			s.readErr, s.readErrFile = err, tokFile.Name()
 		}
 		src = nil
 	}
@@ -1071,21 +1077,26 @@ func isNoLintComment(commentText, linterName string) bool {
 	return false
 }
 
-// nilVarSet returns (building lazily) the set of variables that can only ever
-// hold nil: declared without an initializer, e.g. `var c context.Context`, and
-// never assigned anywhere in the package. Such a variable is not a context
-// that can be passed, so it neither answers the reachability question nor
-// makes a usable fix.
+// nilCtxVarSet returns (building lazily) the set of context variables that can
+// only ever hold nil: declared without an initializer, e.g.
+// `var c context.Context`, and never assigned anywhere in the package. Such a
+// variable is not a context that can be passed, so it neither answers the
+// reachability question nor makes a usable fix.
 //
 // The absence of an initializer alone is not enough: `var ctx context.Context`
 // followed by `ctx = ...` is an ordinary context, and treating it as nil used
 // to suppress the diagnostic entirely. Taking a variable's address counts as
 // an assignment, since the callee may write through the pointer.
-func (s *state) nilVarSet() map[types.Object]bool {
-	if s.nilVars != nil {
-		return s.nilVars
+//
+// The context-type filter is applied here rather than left to the caller so
+// that membership means what the name says: for a non-nilable type such as
+// zerolog.Logger, "declared without an initializer" would mean "zero value",
+// not "nil".
+func (s *state) nilCtxVarSet() map[types.Object]bool {
+	if s.nilCtxVars != nil {
+		return s.nilCtxVars
 	}
-	s.nilVars = make(map[types.Object]bool)
+	s.nilCtxVars = make(map[types.Object]bool)
 	assigned := make(map[types.Object]bool)
 	markAssigned := func(expr ast.Expr) {
 		if obj := s.objectFromExpr(expr); obj != nil {
@@ -1100,8 +1111,8 @@ func (s *state) nilVarSet() map[types.Object]bool {
 					return true
 				}
 				for _, name := range node.Names {
-					if obj := s.pass.TypesInfo.Defs[name]; obj != nil {
-						s.nilVars[obj] = true
+					if obj := s.pass.TypesInfo.Defs[name]; obj != nil && s.isContextType(obj.Type()) {
+						s.nilCtxVars[obj] = true
 					}
 				}
 			case *ast.AssignStmt:
@@ -1123,9 +1134,9 @@ func (s *state) nilVarSet() map[types.Object]bool {
 		})
 	}
 	for obj := range assigned {
-		delete(s.nilVars, obj)
+		delete(s.nilCtxVars, obj)
 	}
-	return s.nilVars
+	return s.nilCtxVars
 }
 
 // reachableCtx answers two separate questions about the call site at pos:
@@ -1163,13 +1174,13 @@ func (s *state) reachableCtx(pos token.Pos) (string, bool) {
 	}
 	scope := fileScope.Innermost(pos)
 
-	nilVars := s.nilVarSet()
+	nilCtxVars := s.nilCtxVarSet()
 	pkgScope := s.pass.Pkg.Scope()
 	// candidate reports whether v holds a context that exists at pos.
 	// Package-level variables may be referenced regardless of their
 	// declaration order; locals only after their declaration.
 	candidate := func(v *types.Var, sc *types.Scope) bool {
-		if nilVars[v] || !s.isContextType(v.Type()) {
+		if nilCtxVars[v] || !s.isContextType(v.Type()) {
 			return false
 		}
 		return sc == pkgScope || v.Pos() < pos

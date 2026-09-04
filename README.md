@@ -260,6 +260,20 @@ ctxLogger := log.With().Ctx(ctx).Logger()
 ctxLogger.Info().Msg("This is fine - context already in logger")
 ```
 
+### Loggers Installed at Construction
+
+```go
+// ✅ Composite-literal field initialisation is tracked, keyed or positional
+app := &App{logger: log.With().Ctx(ctx).Logger()}
+app.logger.Info().Msg("This is fine")
+```
+
+Struct fields are tracked per field declaration rather than per instance, and a
+field counts as context-bearing if *any* assignment to it carries a context.
+That keeps the common constructor shape — a constructor fills the field on one
+variable, methods read it through their own receiver — from being reported, and
+makes the verdict independent of the order the constructors appear in.
+
 ### Variable Tracking
 
 The linter tracks context through variable assignments:

@@ -240,25 +240,60 @@ func reviewVarTupleDecl() {
 	vlogger.Info().Msg("var tuple declaration - must trigger") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
-// PositionalHolder pins positional (unkeyed) struct literal initialisation,
-// which resolves fields by index rather than by key.
-type PositionalHolder struct {
-	logger zerolog.Logger
+// PositionalPair pins positional (unkeyed) struct literal initialisation,
+// which resolves fields by index rather than by key. Two logger fields make
+// the index load-bearing: resolving every element to field 0 would flip both
+// verdicts below.
+type PositionalPair struct {
+	plain  zerolog.Logger
+	ctxLog zerolog.Logger
 }
 
-// reviewPositionalCompositeLit: an unkeyed literal feeds the same per-field
-// fact a keyed one does.
+// reviewPositionalCompositeLit: only the field the context-bearing element is
+// positioned at carries a context.
 func reviewPositionalCompositeLit() {
 	ctx := context.Background()
-	h := PositionalHolder{log.With().Ctx(ctx).Logger()}
-	h.logger.Info().Msg("positional literal carries ctx - should NOT trigger")
+	h := PositionalPair{zerolog.New(os.Stdout), log.With().Ctx(ctx).Logger()}
+	h.ctxLog.Info().Msg("positional element 1 carries ctx - should NOT trigger")
+	h.plain.Info().Msg("positional element 0 does not") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
 }
 
-// reviewPositionalCompositeLitNoCtx: and a plain logger leaves the field
-// untracked.
-func reviewPositionalCompositeLitNoCtx() {
+// GenericHolder pins composite-literal field resolution on an instantiated
+// generic type, where the keyed path (TypesInfo.ObjectOf) and the positional
+// path (Struct.Field) reach the same *types.Var by different routes.
+type GenericHolder[T any] struct {
+	logger zerolog.Logger
+	val    T
+}
+
+// reviewGenericCompositeLit: a keyed literal on an instantiation is tracked.
+func reviewGenericCompositeLit() {
 	ctx := context.Background()
-	_ = ctx
-	h := PositionalHolder{zerolog.New(os.Stdout)}
-	h.logger.Info().Msg("positional literal without ctx") // want "zerolog event missing .Ctx\\(ctx\\) before Msg\\(\\) - context should be included for proper log correlation"
+	h := GenericHolder[int]{logger: log.With().Ctx(ctx).Logger(), val: 1}
+	h.logger.Info().Msg("generic keyed literal is tracked - should NOT trigger")
+}
+
+// reviewDuplicateAssignTarget: Go allows the same target twice in one
+// assignment, so two facts land on the statement's single position. Treating a
+// same-position collision as impossible failed the whole package with an
+// internal-invariant error; the writes join instead, to the silent direction.
+func reviewDuplicateAssignTarget() {
+	ctx := context.Background()
+	var l zerolog.Logger
+	l, l = log.With().Ctx(ctx).Logger(), zerolog.New(os.Stdout)
+	l.Info().Msg("duplicate assignment target - joins to context-bearing")
+}
+
+// EventHolder pins the second position collision: an ExprStmt shares its
+// position with a composite literal it is rooted at, so handleExprStmt and
+// handleCompositeLit write the same field at one position.
+type EventHolder struct {
+	e *zerolog.Event
+}
+
+// reviewExprStmtSharesLiteralPosition must not fail the analysis. There is no
+// terminal call here, so the assertion is the absence of an error.
+func reviewExprStmtSharesLiteralPosition() {
+	ctx := context.Background()
+	EventHolder{e: log.Info()}.e.Ctx(ctx)
 }

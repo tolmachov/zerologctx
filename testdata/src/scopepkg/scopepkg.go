@@ -36,9 +36,12 @@ func closureSeesOuterParam(ctx context.Context) {
 	f()
 }
 
-// uninitializedOnly: `var ctx context.Context` (nil) is not a usable
-// candidate, so the call is not reported.
-func uninitializedOnly() {
+// neverAssignedOnly: a `var ctx context.Context` that is never assigned
+// anywhere in the package can only hold nil, so it is neither a fix candidate
+// nor evidence that a context is reachable. Being uninitialized is not enough
+// on its own — fixpkg's assignedAfterDeclaration and addressTaken pin the
+// cases where such a variable does count.
+func neverAssignedOnly() {
 	var ctx context.Context
 	_ = ctx
 	log.Info().Msg("only nil var - must not trigger")

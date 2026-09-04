@@ -2,14 +2,12 @@
 package zerologctx
 
 import (
-	"fmt"
 	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/packages"
 )
@@ -21,32 +19,67 @@ func TestAnalyzer(t *testing.T) {
 	// Get the test data directory
 	testdata := analysistest.TestData()
 
-	// Run the analyzer on the test packages.
-	// logonlypkg imports only a zerolog sub-package, wrapperconsumer reaches
-	// *zerolog.Event via a local wrapper without directly importing zerolog,
-	// noctxpkg has neither zerolog nor "context" in its import graph and
-	// must be skipped without diagnostics or errors, scopepkg pins the
-	// context-availability gate (no reachable context — no diagnostic), and
-	// deepchainpkg pins fixpoint convergence for a dependency chain deeper
-	// than any fixed pass budget.
-	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrapperconsumer", "noctxpkg", "scopepkg", "deepchainpkg")
+	// Run the analyzer on the test packages. Every package whose fixtures are
+	// meant to assert something must be listed: analysistest checks `want`
+	// comments only in the packages named here, and runs the rest purely as
+	// dependencies.
+	//
+	// logonlypkg imports only a zerolog sub-package; wrappkg is both a
+	// dependency of wrapperconsumer and the source of the exported ctxCarrier
+	// facts, whose `want` annotations pin the exported/unexported split;
+	// wrapperconsumer reaches *zerolog.Event via a local wrapper without
+	// directly importing zerolog and consumes those facts; noctxpkg has
+	// neither zerolog nor "context" in its import graph and must be skipped
+	// without diagnostics or errors; scopepkg pins the context-availability
+	// gate (no reachable context — no diagnostic); deepchainpkg pins fixpoint
+	// convergence for a dependency chain deeper than any fixed pass budget.
+	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrappkg", "wrapperconsumer", "noctxpkg", "scopepkg", "deepchainpkg")
 }
 
 // TestSuggestedFixes verifies the suggested-fix output end-to-end: candidate
-// selection in findCtxInScope (ctx-name preference, nearest-preceding choice,
-// skipping uninitialized vars) and the TextEdit insertion point.
+// selection in reachableCtx (ctx-name preference, nearest-preceding choice,
+// skipping variables that only ever hold nil, address-taking for
+// pointer-receiver context types) and the TextEdit insertion point.
 func TestSuggestedFixes(t *testing.T) {
-	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "fixpkg")
+	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "fixpkg", "pkgctxpkg")
 }
 
-// TestCtxCarrierFact pins the analysis.Fact contract for the cross-package
-// fact: the marker method exists and the value renders a message a driver can
-// print when dumping facts.
-func TestCtxCarrierFact(t *testing.T) {
-	var f analysis.Fact = new(ctxCarrier)
-	f.AFact()
-	if got := fmt.Sprint(f); got == "" {
-		t.Error("ctxCarrier renders an empty string")
+// TestFactTableJoin pins the property collectFacts' termination rests on:
+// writes at one position join rather than overwrite, so the table only ever
+// ascends. token.Pos does not uniquely identify a write site — Go allows the
+// same assignment target twice in one statement, and an ExprStmt shares its
+// position with a composite literal it starts with — so same-position
+// collisions are reachable from ordinary code, and an overwrite would let a
+// later write undo an earlier one and the fixpoint loop spin.
+func TestFactTableJoin(t *testing.T) {
+	zl := types.NewPackage("github.com/rs/zerolog", "zerolog")
+	logger := types.NewNamed(types.NewTypeName(token.NoPos, zl, "Logger", nil), types.NewStruct(nil, nil), nil)
+	obj := types.NewVar(token.NoPos, zl, "l", logger)
+	const pos = token.Pos(10)
+
+	tbl := newFactTable()
+	tbl.set(obj, pos, true)
+	writes := tbl.writes
+
+	tbl.set(obj, pos, false)
+	if !tbl.entries[obj][pos] {
+		t.Error("a false write at an occupied position cleared the context fact; writes must join")
+	}
+	if tbl.writes != writes {
+		t.Errorf("a write that changed nothing counted as progress: writes %d -> %d", writes, tbl.writes)
+	}
+
+	// The reverse order must reach the same state, and must count as progress
+	// so the fixpoint loop runs another pass.
+	tbl2 := newFactTable()
+	tbl2.set(obj, pos, false)
+	writes = tbl2.writes
+	tbl2.set(obj, pos, true)
+	if !tbl2.entries[obj][pos] {
+		t.Error("a context fact did not supersede an earlier contextless write at the same position")
+	}
+	if tbl2.writes == writes {
+		t.Error("an ascending write was not counted as progress; the fixpoint loop would stop early")
 	}
 }
 
@@ -62,40 +95,49 @@ func TestCtxCarrierFact(t *testing.T) {
 // here.
 func TestSuggestedFixesCompile(t *testing.T) {
 	testdata := analysistest.TestData()
-	fixed, err := os.ReadFile(filepath.Join(testdata, "src", "fixpkg", "fixpkg.go.golden"))
-	if err != nil {
-		t.Fatalf("read golden: %v", err)
-	}
+	// Every package TestSuggestedFixes drives must appear here, or its fixes
+	// are compared as text and never compiled.
+	for _, pkg := range []string{"fixpkg", "pkgctxpkg"} {
+		t.Run(pkg, func(t *testing.T) {
+			dir := filepath.Join(testdata, "src", pkg)
+			fixed, err := os.ReadFile(filepath.Join(dir, pkg+".go.golden"))
+			if err != nil {
+				t.Fatalf("read golden: %v", err)
+			}
 
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
-			packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedDeps,
-		Dir: testdata,
-		// GOPATH mode, matching analysistest's own loader.
-		Env: append(os.Environ(), "GOPATH="+testdata, "GO111MODULE=off", "GOWORK=off"),
-		Overlay: map[string][]byte{
-			filepath.Join(testdata, "src", "fixpkg", "fixpkg.go"): fixed,
-		},
-	}
-	pkgs, err := packages.Load(cfg, "fixpkg")
-	if err != nil {
-		t.Fatalf("load fixpkg with suggested fixes applied: %v", err)
-	}
-	if len(pkgs) != 1 {
-		t.Fatalf("loaded %d packages, want 1", len(pkgs))
-	}
-	if pkgs[0].Name == "" {
-		t.Fatalf("fixpkg failed to load at all: %v", pkgs[0].Errors)
-	}
-	for _, e := range pkgs[0].Errors {
-		t.Errorf("source with suggested fixes applied does not compile: %v", e)
+			cfg := &packages.Config{
+				Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+					packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedDeps,
+				Dir: testdata,
+				// GOPATH mode, matching analysistest's own loader.
+				Env: append(os.Environ(), "GOPATH="+testdata, "GO111MODULE=off", "GOWORK=off"),
+				Overlay: map[string][]byte{
+					filepath.Join(dir, pkg+".go"): fixed,
+				},
+			}
+			pkgs, err := packages.Load(cfg, pkg)
+			if err != nil {
+				t.Fatalf("load %s with suggested fixes applied: %v", pkg, err)
+			}
+			if len(pkgs) != 1 {
+				t.Fatalf("loaded %d packages, want 1", len(pkgs))
+			}
+			if pkgs[0].Name == "" {
+				t.Fatalf("%s failed to load at all: %v", pkg, pkgs[0].Errors)
+			}
+			for _, e := range pkgs[0].Errors {
+				t.Errorf("source with suggested fixes applied does not compile: %v", e)
+			}
+		})
 	}
 }
 
-// TestIsContextType directly tests the isContextType method against synthetic
-// go/types constructs. This exercises cases that cannot be expressed in the
-// testdata fixtures because the stub's Ctx(context.Context) parameter rejects
-// non-context values at compile time.
+// TestIsContextType directly tests context-interface satisfaction against
+// synthetic go/types constructs, covering shapes the testdata fixtures cannot
+// express: a type whose methods have the right names but the wrong signatures,
+// and non-named types. The addressableContext half of isContextType — a value
+// whose type satisfies context.Context only through its pointer — is covered
+// end-to-end by fixpkg, which pins the resulting &v fix text.
 func TestIsContextType(t *testing.T) {
 	// Build a minimal context.Context interface: Deadline, Done, Err, Value.
 	pkg := types.NewPackage("ctxtest", "ctxtest")

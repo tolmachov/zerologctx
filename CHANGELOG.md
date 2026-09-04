@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug fixes
 
+- **Two shapes of legal Go failed the analyzer outright.** Facts are keyed by
+  `token.Pos`, which does not uniquely identify a write site: Go allows the
+  same assignment target twice in one statement (`l, l = ctxLogger, plain`),
+  and an `ExprStmt` shares its position with a composite literal it is rooted
+  at (`H{e: log.Info()}.e.Ctx(ctx)`). Both made two facts land on one key,
+  which the monotonicity guard reported as a broken internal invariant,
+  failing the whole package. Writes at one position now join rather than
+  overwrite, which also makes the fixpoint ascend by construction — so the
+  guard, and the error path with it, are gone.
+- **A field's verdict depended on which constructor was written first.** Field
+  and package-level facts were looked up by nearest preceding position, but
+  those objects are written and read from unrelated functions. Swapping two
+  constructors in a file flipped the diagnostic on an unrelated method. They
+  are now context-bearing if any assignment to them carries a context — the
+  same rule already applied across package boundaries — and only locals and
+  parameters keep position-ordered lookup.
+- **Composite-literal tracking introduced a false positive** it was meant to
+  remove: one `&App{logger: zerolog.New(...)}` anywhere poisoned every later
+  use of that field. Fixed by the same ordering change.
+- A driver that does not populate `types.Info.Scopes` disabled every
+  diagnostic while exiting successfully; `newState` now fails loudly, matching
+  how a corrupted `FileSet` is already treated.
 - **Context-bearing loggers from other packages were reported.** The analysis
   stopped at the package boundary, so an exported logger declared as
   `var Default = log.With().Ctx(ctx).Logger()` in one package produced a
@@ -96,12 +118,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Diagnostics now include an `analysis.SuggestedFix` that inserts
   `.Ctx(ctx)` before the terminal method when an in-scope variable
   satisfying `context.Context` is available.
-- Added `Print` and `WithLevel` to the recognised log-level methods so that
-  `loggerWithCtx.Print().Msg(...)` and similar do not produce false positives.
+- Event-producing Logger methods are recognised by type rather than by a
+  method whitelist, so `Err`, `WithLevel` and any future addition are covered
+  without a list to keep in sync.
 - The analyzer now short-circuits packages that do not transitively import
   `github.com/rs/zerolog`, eliminating per-package overhead in monorepos.
 
 ### Internal cleanup
+
+- `factKind` deleted. `factTable.set` only ever accepted the one positive kind
+  matching the key's type, so the stored kind was a pure function of the key
+  and carried no information; entries are now `bool` and the predicates check
+  `trackKind` directly. `positiveFactFor` went with it.
+- The `dirty` flag became a monotone write counter, so there is no flag to
+  forget to reset — which, with the pass budget gone, would have left the
+  fixpoint loop spinning.
+- `nilVarSet` filters by type at construction, so membership means what the
+  name says rather than relying on its one caller to filter.
 
 - `findCtxInScope` split into `reachableCtx` (is a context reachable — the
   report gate) and the `fixExprFor`/`ctxExpr` pair (how to write it — the fix),
@@ -122,23 +155,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-pass state (`loggersWithCtx`, `eventsWithCtx`, `contextIface`,
   `fileMap`) consolidated into a single `state` struct; helpers became
   methods.
-- `hasCtxInChain` and `hasCtxInContextChain` unified into a single
-  `hasCtxCallInChain` parameterised by whether to enforce a `*zerolog.Event`
-  receiver.
-- Dead `ctxChainCache` removed (recursive calls always bypassed it; the
-  cache never hit in practice).
 - `hasNoLintDirective` file lookup now uses a precomputed
   `map[*token.File]*ast.File` (was O(N) per diagnostic).
-- `logLevelMethods` hoisted to a package-level var (was reallocated on every
-  invocation of `isEventFromLoggerWithContext`).
 - testdata `zerolog` stub: `Event.Ctx`/`Context.Ctx` now take `context.Context`
   instead of `interface{}`, matching the real library and exposing the
   type-checking branches to realistic inputs.
 - `cmd/zerologctx/main_test.go` no longer references `_ = main` as a smoke
   test; it builds the binary in a tempdir and runs it with `-h` to actually
   exercise the CLI entry point.
-- `plugin/plugin_test.go` now runs the analyzer returned from `GetAnalyzers`
-  through `analysistest` end-to-end (not just identity checks).
 - `BenchmarkImplementsContextInterface` (previously `b.Skip`'d) replaced
   with a working `BenchmarkIsContextType` that builds a synthetic
   `*types.Named` to exercise `types.Implements`.

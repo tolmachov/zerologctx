@@ -17,7 +17,7 @@ func Info() *zerolog.Event {
 
 // CtxLogger is an exported package-level logger with an embedded context. The
 // ctxCarrier fact has to carry that across the package boundary.
-var CtxLogger = zerolog.New(os.Stdout).With().Ctx(context.Background()).Logger()
+var CtxLogger = zerolog.New(os.Stdout).With().Ctx(context.Background()).Logger() // want CtxLogger:"carries a context"
 
 // PlainLogger has no context, so importers must keep getting diagnostics for
 // it — the fact mechanism must not suppress by merely being present.
@@ -25,7 +25,7 @@ var PlainLogger = zerolog.New(os.Stdout)
 
 // Cfg exposes both through exported fields, initialised by composite literal.
 type Cfg struct {
-	CtxLogger   zerolog.Logger
+	CtxLogger   zerolog.Logger // want CtxLogger:"carries a context"
 	PlainLogger zerolog.Logger
 }
 
@@ -36,7 +36,8 @@ var Shared = Cfg{
 }
 
 // unexportedCtxLogger cannot be named from another package, so no fact is
-// published for it; within this package it is tracked as usual.
+// published for it — the absence of a `want` annotation here is the assertion.
+// Within this package it is tracked as usual.
 var unexportedCtxLogger = zerolog.New(os.Stdout).With().Ctx(context.Background()).Logger()
 
 func useUnexported(ctx context.Context) {
