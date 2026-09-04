@@ -17,11 +17,17 @@
 //     e := log.Info(); e.Ctx(ctx); e.Msg("hi")
 //   - Custom context types satisfying context.Context (e.g. via embedding).
 //
-// A diagnostic is emitted only when a context is actually available at the
+// A diagnostic is emitted only when a context is actually reachable at the
 // call site — a context.Context-typed function parameter, a local variable
 // declared before the call, a package-level variable, or a field of the
 // enclosing method's receiver. Calls in code that has no context to pass are
 // not reported.
+//
+// Reachability and fixability are separate: a reachable context whose name is
+// shadowed at the call site is still reported, but without a suggested fix,
+// since inserting the name would reference the shadowing declaration instead.
+// A value whose type satisfies context.Context only through its pointer is
+// suggested as &v.
 //
 // A //nolint:zerologctx (or //nolint:all, or bare //nolint) comment is
 // honoured when it appears on one of the chain's own lines (from the chain
@@ -48,6 +54,8 @@
 //     Event at the call site instead.
 //   - Only the canonical github.com/rs/zerolog import path is recognised;
 //     forks and copies vendored under other paths are not.
+//   - Contexts promoted from a struct embedded in the receiver are not seen;
+//     only the receiver's own fields are.
 package zerologctx
 
 import (
@@ -145,14 +153,6 @@ func positiveFactFor(k trackKind) factKind {
 	return factNone
 }
 
-// maxFactPasses bounds the fact-collection fixpoint loop. Facts only move
-// from factNone to a positive kind (the predicates are monotone in the fact
-// table), so the loop terminates naturally; each pass resolves at least one
-// more link of an out-of-source-order dependency chain, and chains deeper
-// than this are reported by collectFacts as an error instead of silently
-// truncating the analysis into false positives.
-const maxFactPasses = 10
-
 // state holds the per-pass mutable analysis state.
 type state struct {
 	pass *analysis.Pass
@@ -185,10 +185,11 @@ type state struct {
 	// documented nolint semantics.
 	readErr error
 
-	// noInitVars caches the set of variables declared without an initializer
-	// (`var c context.Context`); such variables make poor suggested-fix
-	// candidates. Built lazily by noInitVarSet.
-	noInitVars map[types.Object]bool
+	// nilVars caches the set of variables that can only ever hold nil: declared
+	// without an initializer and never assigned anywhere in the package. They
+	// are neither fix candidates nor evidence that a context is reachable.
+	// Built lazily by nilVarSet.
+	nilVars map[types.Object]bool
 }
 
 // newState constructs a fresh analysis state for the given pass, including
@@ -263,17 +264,22 @@ func run(pass *analysis.Pass) (any, error) {
 // collectFacts runs the fact-collection phase over assignments, var
 // declarations and mutating Event statements, repeated to a fixpoint so facts
 // that depend on other facts (aliases, package-level declarations in later
-// files) propagate regardless of source order. Hitting maxFactPasses means an
-// out-of-source-order dependency chain deeper than the cap (or a broken
-// monotonicity invariant after a future change); both must be loud, since a
-// silently truncated fact table produces baffling false positives.
+// files) propagate regardless of source order.
+//
+// The loop needs no pass budget: the fact lattice is finite (one entry per
+// tracked object and assignment position) and every write ascends it, so a
+// pass that changes nothing ends the loop and a pass that changes something
+// has consumed one of finitely many ascents. A dependency chain running
+// against the traversal order resolves one link per pass, however deep it is.
+// The only way this could spin is a future predicate that is not monotone in
+// the fact table, and factTable.set detects that directly.
 func (s *state) collectFacts(insp *inspector.Inspector) error {
 	factNodes := []ast.Node{
 		(*ast.AssignStmt)(nil),
 		(*ast.ValueSpec)(nil),
 		(*ast.ExprStmt)(nil),
 	}
-	for range maxFactPasses {
+	for {
 		s.facts.dirty = false
 		insp.Preorder(factNodes, func(n ast.Node) {
 			switch node := n.(type) {
@@ -285,11 +291,13 @@ func (s *state) collectFacts(insp *inspector.Inspector) error {
 				s.handleExprStmt(node)
 			}
 		})
+		if s.facts.violation != nil {
+			return s.facts.violation
+		}
 		if !s.facts.dirty {
 			return nil
 		}
 	}
-	return fmt.Errorf("zerologctx: fact propagation did not converge after %d passes", maxFactPasses)
 }
 
 // scanImports walks pkg's transitive import graph once, reporting whether
@@ -337,6 +345,12 @@ type factTable struct {
 	// dirty is set by set when a collection pass learns something new; the
 	// fixpoint loop in collectFacts stops when a full pass leaves it false.
 	dirty bool
+
+	// violation holds the first non-monotone rewrite seen by set. It can only
+	// be reached by a predicate that regressed a fact, which would also be the
+	// only way to make the collectFacts loop spin; surfacing it as an error
+	// keeps that a loud bug report rather than a hang.
+	violation error
 }
 
 func newFactTable() *factTable {
@@ -347,6 +361,10 @@ func newFactTable() *factTable {
 // whose kind does not match the object's track category (the positiveFactFor
 // correspondence) are rejected: they would corrupt lookups that compare
 // against a specific kind.
+//
+// Facts only ascend: a positive kind may supersede factNone at the same
+// position, never the reverse. That is what makes collectFacts terminate, so a
+// rewrite that breaks it is recorded instead of applied.
 func (t *factTable) set(obj types.Object, pos token.Pos, kind factKind) {
 	if kind != factNone && kind != positiveFactFor(trackKindOf(obj.Type())) {
 		return
@@ -356,10 +374,19 @@ func (t *factTable) set(obj types.Object, pos token.Pos, kind factKind) {
 		m = make(map[token.Pos]factKind)
 		t.entries[obj] = m
 	}
-	if old, ok := m[pos]; !ok || old != kind {
-		m[pos] = kind
-		t.dirty = true
+	switch old, ok := m[pos]; {
+	case ok && old == kind:
+		return
+	case ok && old != factNone:
+		if t.violation == nil {
+			t.violation = fmt.Errorf(
+				"zerologctx: internal invariant broken: fact for %q regressed from kind %d to %d; the fact lattice is no longer monotone",
+				obj.Name(), old, kind)
+		}
+		return
 	}
+	m[pos] = kind
+	t.dirty = true
 }
 
 // at returns what the table knows about obj at the given use position.
@@ -541,28 +568,34 @@ func (s *state) handleCall(node *ast.CallExpr) {
 		return
 	}
 
-	// Report only when a context is actually available at the call site — as
+	// Report only when a context is actually reachable at the call site — as
 	// a scope variable or a receiver field. When there is nothing to pass,
 	// there is nothing to fix, so stay silent.
-	ctxName, ok := s.findCtxInScope(node.Pos())
-	if !ok {
+	ctxExpr, reachable := s.reachableCtx(node.Pos())
+	if !reachable {
 		return
 	}
-	s.pass.Report(analysis.Diagnostic{
+	diag := analysis.Diagnostic{
 		Pos: node.Pos(),
 		Message: fmt.Sprintf(
 			"zerolog event missing .Ctx(ctx) before %s() - context should be included for proper log correlation",
 			sel.Sel.Name,
 		),
-		SuggestedFixes: []analysis.SuggestedFix{{
-			Message: fmt.Sprintf("Insert .Ctx(%s) before %s()", ctxName, sel.Sel.Name),
+	}
+	// A reachable context that cannot be named here (shadowed by another
+	// declaration) still deserves the diagnostic, but not a fix that would
+	// insert the wrong value.
+	if ctxExpr != "" {
+		diag.SuggestedFixes = []analysis.SuggestedFix{{
+			Message: fmt.Sprintf("Insert .Ctx(%s) before %s()", ctxExpr, sel.Sel.Name),
 			TextEdits: []analysis.TextEdit{{
 				Pos:     sel.Sel.Pos(),
 				End:     sel.Sel.Pos(),
-				NewText: []byte("Ctx(" + ctxName + ")."),
+				NewText: []byte("Ctx(" + ctxExpr + ")."),
 			}},
-		}},
-	})
+		}}
+	}
+	s.pass.Report(diag)
 }
 
 // eventHasCtx reports whether expr — an expression of type *zerolog.Event —
@@ -665,13 +698,14 @@ func (s *state) factIs(expr ast.Expr, at token.Pos, kind factKind) bool {
 }
 
 // callArgIsContext reports whether the call's first argument satisfies
-// context.Context.
+// context.Context as written. The check is exact rather than "could be passed
+// after taking its address": the compiler has already accepted the argument,
+// so anything looser would only mask a genuinely non-context value.
 func (s *state) callArgIsContext(call *ast.CallExpr) bool {
 	if len(call.Args) == 0 {
 		return false
 	}
-	argType := s.pass.TypesInfo.TypeOf(call.Args[0])
-	return argType != nil && s.isContextType(argType)
+	return s.implementsContext(s.pass.TypesInfo.TypeOf(call.Args[0]))
 }
 
 // chainHasNonCtxArg reports whether the Event chain contains a Ctx() call on
@@ -695,23 +729,48 @@ func (s *state) chainHasNonCtxArg(expr ast.Expr) bool {
 	}
 }
 
-// isContextType reports whether typ satisfies context.Context (directly or
-// via a custom type that embeds it).
+// isContextType reports whether a value of typ can be handed to Ctx(), either
+// as written or by taking its address. This is the reachability question — is
+// there a context here at all — and is deliberately wider than
+// implementsContext; use ctxExpr to render the value, since the two cases need
+// different syntax.
 func (s *state) isContextType(typ types.Type) bool {
+	return s.implementsContext(typ) || s.addressableContext(typ)
+}
+
+// implementsContext reports whether typ itself satisfies context.Context
+// (directly or via a custom type that embeds it).
+func (s *state) implementsContext(typ types.Type) bool {
+	return typ != nil && s.contextIface != nil && types.Implements(typ, s.contextIface)
+}
+
+// addressableContext reports whether typ does not satisfy context.Context but
+// *typ does — the shape of a custom context type whose methods use pointer
+// receivers. Such a value can only be passed as &v, so treating it like a
+// plain context (as an earlier version of isContextType did) produced
+// suggested fixes that did not compile.
+func (s *state) addressableContext(typ types.Type) bool {
 	if typ == nil || s.contextIface == nil {
 		return false
 	}
-	if types.Implements(typ, s.contextIface) {
-		return true
+	if _, isPtr := typ.(*types.Pointer); isPtr {
+		return false
 	}
-	// Also try the pointer type: a type whose methods use pointer receivers
-	// implements the interface only through *T.
-	if _, isPtr := typ.(*types.Pointer); !isPtr {
-		if types.Implements(types.NewPointer(typ), s.contextIface) {
-			return true
-		}
+	return !types.Implements(typ, s.contextIface) &&
+		types.Implements(types.NewPointer(typ), s.contextIface)
+}
+
+// ctxExpr renders name as an expression of type context.Context: the name
+// itself, or its address when only the pointer type satisfies the interface.
+// Reports false when the value is not a context at all.
+func (s *state) ctxExpr(name string, typ types.Type) (string, bool) {
+	switch {
+	case s.implementsContext(typ):
+		return name, true
+	case s.addressableContext(typ):
+		return "&" + name, true
 	}
-	return false
+	return "", false
 }
 
 // isZerologNamed reports whether t (or its pointer element) is the named type
@@ -900,42 +959,81 @@ func isNoLintComment(commentText, linterName string) bool {
 	return false
 }
 
-// noInitVarSet returns (building lazily) the set of variables declared
-// without an initializer, e.g. `var c context.Context`. Suggesting such a
-// variable in a fix would insert a nil context.
-func (s *state) noInitVarSet() map[types.Object]bool {
-	if s.noInitVars != nil {
-		return s.noInitVars
+// nilVarSet returns (building lazily) the set of variables that can only ever
+// hold nil: declared without an initializer, e.g. `var c context.Context`, and
+// never assigned anywhere in the package. Such a variable is not a context
+// that can be passed, so it neither answers the reachability question nor
+// makes a usable fix.
+//
+// The absence of an initializer alone is not enough: `var ctx context.Context`
+// followed by `ctx = ...` is an ordinary context, and treating it as nil used
+// to suppress the diagnostic entirely. Taking a variable's address counts as
+// an assignment, since the callee may write through the pointer.
+func (s *state) nilVarSet() map[types.Object]bool {
+	if s.nilVars != nil {
+		return s.nilVars
 	}
-	s.noInitVars = make(map[types.Object]bool)
+	s.nilVars = make(map[types.Object]bool)
+	assigned := make(map[types.Object]bool)
+	markAssigned := func(expr ast.Expr) {
+		if obj := s.objectFromExpr(expr); obj != nil {
+			assigned[obj] = true
+		}
+	}
 	for _, f := range s.pass.Files {
 		ast.Inspect(f, func(n ast.Node) bool {
-			vs, ok := n.(*ast.ValueSpec)
-			if !ok || len(vs.Values) != 0 {
-				return true
-			}
-			for _, name := range vs.Names {
-				if obj := s.pass.TypesInfo.Defs[name]; obj != nil {
-					s.noInitVars[obj] = true
+			switch node := n.(type) {
+			case *ast.ValueSpec:
+				if len(node.Values) != 0 {
+					return true
+				}
+				for _, name := range node.Names {
+					if obj := s.pass.TypesInfo.Defs[name]; obj != nil {
+						s.nilVars[obj] = true
+					}
+				}
+			case *ast.AssignStmt:
+				for _, lhs := range node.Lhs {
+					markAssigned(lhs)
+				}
+			case *ast.RangeStmt:
+				for _, lhs := range []ast.Expr{node.Key, node.Value} {
+					if lhs != nil {
+						markAssigned(lhs)
+					}
+				}
+			case *ast.UnaryExpr:
+				if node.Op == token.AND {
+					markAssigned(node.X)
 				}
 			}
 			return true
 		})
 	}
-	return s.noInitVars
+	for obj := range assigned {
+		delete(s.nilVars, obj)
+	}
+	return s.nilVars
 }
 
-// findCtxInScope searches the lexical scopes around pos for a variable that
-// satisfies context.Context. Its result decides both whether a missing-Ctx
-// diagnostic is reported at all (no candidate — no report) and which name the
-// suggested fix inserts. Variables literally named "ctx" are preferred;
-// otherwise the nearest preceding candidate in the innermost scope that has
-// one is used. Package-level candidates are usable regardless of declaration
-// order. Variables declared without an initializer are skipped. When no scope
-// variable qualifies, a context-typed field of the enclosing method's
-// receiver (as "recv.field") is used as a last resort. Returns "", false if
-// no candidate exists.
-func (s *state) findCtxInScope(pos token.Pos) (string, bool) {
+// reachableCtx answers two separate questions about the call site at pos:
+// whether a context.Context is reachable there at all — the gate for reporting
+// a missing-Ctx diagnostic — and, when one can also be referenced safely, the
+// expression a suggested fix should insert.
+//
+// The two are deliberately not the same question. A context shadowed at the
+// call site is reachable (renaming the shadow makes it usable), so the
+// diagnostic stands, but writing its name into a fix would silently retarget
+// the call, so no fix is offered. A blank field, by contrast, can never be
+// referenced and is therefore not reachable at all.
+//
+// Candidates are ranked as follows: a variable literally named "ctx" wins,
+// even from an outer scope; otherwise the nearest preceding candidate in the
+// innermost scope that has one. Package-level candidates are usable regardless
+// of declaration order. Variables stuck at nil are skipped. When no scope
+// variable qualifies, a context-typed field of the enclosing method's receiver
+// is the last resort.
+func (s *state) reachableCtx(pos token.Pos) (string, bool) {
 	if s.contextIface == nil {
 		return "", false
 	}
@@ -947,67 +1045,90 @@ func (s *state) findCtxInScope(pos token.Pos) (string, bool) {
 	if astFile == nil {
 		return "", false
 	}
-	scope := s.pass.TypesInfo.Scopes[astFile]
-	if scope == nil {
+	fileScope := s.pass.TypesInfo.Scopes[astFile]
+	if fileScope == nil {
 		return "", false
 	}
-	scope = scope.Innermost(pos)
+	scope := fileScope.Innermost(pos)
 
-	noInit := s.noInitVarSet()
+	nilVars := s.nilVarSet()
 	pkgScope := s.pass.Pkg.Scope()
-	usable := func(v *types.Var, sc *types.Scope) bool {
-		if noInit[v] || !s.isContextType(v.Type()) {
+	// candidate reports whether v holds a context that exists at pos.
+	// Package-level variables may be referenced regardless of their
+	// declaration order; locals only after their declaration.
+	candidate := func(v *types.Var, sc *types.Scope) bool {
+		if nilVars[v] || !s.isContextType(v.Type()) {
 			return false
 		}
-		// Package-level variables may be referenced regardless of their
-		// declaration order; locals only after their declaration.
 		return sc == pkgScope || v.Pos() < pos
 	}
 
-	fallback := ""
-	for sc := scope; sc != nil; sc = sc.Parent() {
+	reachable := false
+	best := ""
+	var bestPos token.Pos
+	bestPreceding := false
+	for sc := scope; sc != nil && sc != types.Universe; sc = sc.Parent() {
 		// Prefer a variable literally named "ctx", even from an outer scope.
-		if obj := sc.Lookup("ctx"); obj != nil {
-			if v, ok := obj.(*types.Var); ok && usable(v, sc) {
-				return "ctx", true
+		if v, ok := sc.Lookup("ctx").(*types.Var); ok && candidate(v, sc) {
+			reachable = true
+			if expr, ok := s.fixExprFor("ctx", v, scope, pos); ok {
+				return expr, true
 			}
 		}
-		if fallback != "" {
+		if best != "" {
 			continue
 		}
 		// Pick the nearest preceding candidate in this scope; fall back to
 		// any candidate for order-independent (package) scope.
-		var bestName string
-		var bestPos token.Pos
-		bestPreceding := false
 		for _, name := range sc.Names() {
 			v, ok := sc.Lookup(name).(*types.Var)
-			if !ok || !usable(v, sc) {
+			if !ok || !candidate(v, sc) {
+				continue
+			}
+			reachable = true
+			expr, ok := s.fixExprFor(name, v, scope, pos)
+			if !ok {
 				continue
 			}
 			preceding := v.Pos() < pos
 			switch {
-			case bestName == "",
+			case best == "",
 				preceding && !bestPreceding,
 				preceding == bestPreceding && preceding && v.Pos() > bestPos:
-				bestName, bestPos, bestPreceding = name, v.Pos(), preceding
+				best, bestPos, bestPreceding = expr, v.Pos(), preceding
 			}
 		}
-		fallback = bestName
 	}
-	if fallback != "" {
-		return fallback, true
+	if best != "" {
+		return best, true
 	}
-	return s.receiverCtxField(astFile, pos)
+	fieldExpr, fieldReachable := s.receiverCtx(astFile, scope, pos)
+	return fieldExpr, reachable || fieldReachable
 }
 
-// receiverCtxField looks for a context-typed field on the receiver of the
-// method enclosing pos and returns it as a "recv.field" selector. Calls
-// inside a FuncLit nested in a method still resolve to that method's
-// receiver. Only direct struct fields are considered, not fields promoted
-// from embedded structs; an embedded context.Context itself counts (as
-// "recv.Context").
-func (s *state) receiverCtxField(astFile *ast.File, pos token.Pos) (string, bool) {
+// fixExprFor renders v as the expression a suggested fix would insert at pos,
+// reporting false when it cannot be written safely there. The name must still
+// denote v at pos — an inner declaration of the same name would silently
+// retarget the inserted expression into a compile error — and the value has to
+// be renderable as a context.Context.
+func (s *state) fixExprFor(name string, v *types.Var, scope *types.Scope, pos token.Pos) (string, bool) {
+	if _, obj := scope.LookupParent(name, pos); obj != v {
+		return "", false
+	}
+	return s.ctxExpr(name, v.Type())
+}
+
+// receiverCtx looks for a context-typed field on the receiver of the method
+// enclosing pos. It returns the expression a fix should insert ("recv.field",
+// or "&recv.field" when only the pointer type satisfies context.Context) and
+// whether such a field exists at all — the same reachable/fixable split as
+// reachableCtx. Calls inside a FuncLit nested in a method still resolve to
+// that method's receiver. Only direct struct fields are considered, not fields
+// promoted from embedded structs; an embedded context.Context itself counts
+// (as "recv.Context"). A blank field can never be referenced, so it is not
+// reachable; a receiver name taken over by a local is reachable but not
+// fixable.
+func (s *state) receiverCtx(astFile *ast.File, scope *types.Scope, pos token.Pos) (string, bool) {
 	for _, decl := range astFile.Decls {
 		fd, ok := decl.(*ast.FuncDecl)
 		if !ok || fd.Recv == nil || pos < fd.Pos() || pos >= fd.End() {
@@ -1032,10 +1153,23 @@ func (s *state) receiverCtxField(astFile *ast.File, pos token.Pos) (string, bool
 		if !ok {
 			return "", false
 		}
+		_, named := scope.LookupParent(recvIdent.Name, pos)
 		for f := range st.Fields() {
-			if s.isContextType(f.Type()) {
-				return recvIdent.Name + "." + f.Name(), true
+			// A blank field cannot be referenced by any expression, so its
+			// context is not reachable through the receiver.
+			if f.Name() == "_" {
+				continue
 			}
+			expr, ok := s.ctxExpr(recvIdent.Name+"."+f.Name(), f.Type())
+			if !ok {
+				continue
+			}
+			// The field exists either way; the fix only holds while the
+			// receiver name still denotes the receiver at pos.
+			if named != obj {
+				return "", true
+			}
+			return expr, true
 		}
 		return "", false
 	}
