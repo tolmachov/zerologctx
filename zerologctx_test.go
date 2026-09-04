@@ -2,12 +2,14 @@
 package zerologctx
 
 import (
+	"fmt"
 	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/packages"
 )
@@ -35,6 +37,17 @@ func TestAnalyzer(t *testing.T) {
 // skipping uninitialized vars) and the TextEdit insertion point.
 func TestSuggestedFixes(t *testing.T) {
 	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "fixpkg")
+}
+
+// TestCtxCarrierFact pins the analysis.Fact contract for the cross-package
+// fact: the marker method exists and the value renders a message a driver can
+// print when dumping facts.
+func TestCtxCarrierFact(t *testing.T) {
+	var f analysis.Fact = new(ctxCarrier)
+	f.AFact()
+	if got := fmt.Sprint(f); got == "" {
+		t.Error("ctxCarrier renders an empty string")
+	}
 }
 
 // TestSuggestedFixesCompile type-checks fixpkg.go.golden — the source

@@ -60,6 +60,34 @@ go build ./cmd/zerologctx
 go install ./cmd/zerologctx
 ```
 
+### Verifying the golangci-lint plugin
+
+The `plugin` package's unit tests pin the registration contract, but the wiring
+golangci-lint actually uses is only exercised by building a custom binary. Do
+this from a scratch directory when you touch `plugin/`:
+
+```bash
+mkdir -p /tmp/gcl && cd /tmp/gcl
+cat > .custom-gcl.yml <<EOF
+version: v2.13.2
+name: golangci-lint-zerologctx
+destination: /tmp/gcl/bin
+plugins:
+  - module: github.com/tolmachov/zerologctx
+    import: github.com/tolmachov/zerologctx/plugin
+    path: /path/to/your/zerologctx/checkout
+EOF
+golangci-lint custom
+```
+
+Then run `/tmp/gcl/bin/golangci-lint-zerologctx run` against a project that
+uses zerolog. Note golangci-lint's default `max-same-issues: 3` caps repeated
+diagnostics; pass `--max-same-issues=0` when comparing against the standalone
+CLI's output.
+
+This is deliberately not a CI step: it clones and builds golangci-lint from
+source, which is minutes of CI time for a surface that changes rarely.
+
 ## Making Changes
 
 ### Branch Naming
