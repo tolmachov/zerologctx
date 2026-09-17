@@ -1,111 +1,83 @@
-// Benchmarks for the zerologctx analyzer
 package zerologctx
 
 import (
-	"go/token"
-	"go/types"
+	"os"
 	"testing"
+
+	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/analysistest"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
+	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 )
 
-// BenchmarkIsNoLintComment benchmarks the nolint comment parsing function.
-func BenchmarkIsNoLintComment(b *testing.B) {
-	testCases := []struct {
-		name     string
-		comment  string
-		linter   string
-		expected bool
-	}{
-		{"simple", "//nolint:zerologctx", "zerologctx", true},
-		{"with_spaces", "// nolint: zerologctx", "zerologctx", true},
-		{"multiple", "//nolint:linter1,zerologctx,linter2", "zerologctx", true},
-		{"not_found", "//nolint:otherlinter", "zerologctx", false},
+// BenchmarkFrameJoin exercises every map a frame carries, including the
+// location sets inside the joined values: a frame holding only bare SSA values
+// skips most of joinValue.
+func BenchmarkFrameJoin(b *testing.B) {
+	left, right := newFrame(), newFrame()
+	for range 1024 {
+		alloc := &ssa.Alloc{}
+		memory := memoryLocation{root: alloc}
+		event := eventLocation{value: alloc}
+		left.values[alloc] = abstractValue{
+			kind: kindEvent, state: stateHasContext,
+			locs: map[eventLocation]struct{}{event: {}}, memLocs: map[memoryLocation]struct{}{memory: {}},
+		}
+		right.values[alloc] = abstractValue{
+			kind: kindEvent, state: stateNoContext,
+			locs: map[eventLocation]struct{}{{value: alloc, index: 1}: {}},
+		}
+		left.memory[memory] = abstractValue{kind: kindLogger, state: stateHasContext}
+		right.memory[memory] = abstractValue{kind: kindLogger, state: stateNoContext}
+		left.events[event] = eventState{state: stateHasContext, ctxWasNil: true}
+		right.events[event] = eventState{state: stateNoContext}
+		right.writes[&ssa.Parameter{}] = true
 	}
-
-	for _, tc := range testCases {
-		b.Run(tc.name, func(b *testing.B) {
-			b.ResetTimer()
-			for b.Loop() {
-				_ = isNoLintComment(tc.comment, tc.linter)
-			}
-		})
+	joined := left.clone()
+	b.ReportAllocs()
+	for b.Loop() {
+		joinFrame(joined, right)
 	}
 }
 
-// BenchmarkIsContextType benchmarks the context-interface satisfaction check
-// against a synthetic *types.Named that fully implements context.Context.
-//
-// The named type's methods and the interface's methods are constructed from
-// separate *types.Func objects with matching but distinct signatures so that
-// types.Implements performs real signature comparison rather than the trivial
-// same-pointer-identity fast path.
-func BenchmarkIsContextType(b *testing.B) {
-	pkg := types.NewPackage("ctxbench", "ctxbench")
-
-	// time.Time placeholder (just needs to be a distinct named type).
-	timePkg := types.NewPackage("time", "time")
-	timeType := types.NewNamed(types.NewTypeName(token.NoPos, timePkg, "Time", nil), types.NewStruct(nil, nil), nil)
-
-	// <-chan struct{} for Done() — must be receive-only, matching context.Context.
-	chanStruct := types.NewChan(types.RecvOnly, types.NewStruct(nil, nil))
-
-	// Deadline() (time.Time, bool)
-	deadlineSig := func() *types.Signature {
-		results := types.NewTuple(
-			types.NewVar(token.NoPos, nil, "", timeType),
-			types.NewVar(token.NoPos, nil, "", types.Typ[types.Bool]),
-		)
-		return types.NewSignatureType(nil, nil, nil, nil, results, false)
+func BenchmarkSSAEngineLargeAliasCFG(b *testing.B) {
+	testdata := analysistest.TestData()
+	packagesUnderTest, err := packages.Load(&packages.Config{
+		Mode: packages.LoadAllSyntax,
+		Dir:  testdata,
+		Env:  append(os.Environ(), "GOWORK=off"),
+	}, "./strictpkg")
+	if err != nil {
+		b.Fatal(err)
 	}
-	// Done() <-chan struct{}
-	doneSig := func() *types.Signature {
-		results := types.NewTuple(types.NewVar(token.NoPos, nil, "", chanStruct))
-		return types.NewSignatureType(nil, nil, nil, nil, results, false)
+	if len(packagesUnderTest) != 1 {
+		b.Fatalf("loaded %d packages, want 1", len(packagesUnderTest))
 	}
-	// Err() error
-	errSig := func() *types.Signature {
-		results := types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("error").Type()))
-		return types.NewSignatureType(nil, nil, nil, nil, results, false)
-	}
-	// Value(key any) any
-	valueSig := func() *types.Signature {
-		params := types.NewTuple(types.NewVar(token.NoPos, nil, "key", types.Universe.Lookup("any").Type()))
-		results := types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("any").Type()))
-		return types.NewSignatureType(nil, nil, nil, params, results, false)
+	for _, loadError := range packagesUnderTest[0].Errors {
+		b.Fatalf("load strictpkg: %v", loadError)
 	}
 
-	// Build the interface with one set of Func objects.
-	ifaceMethods := []*types.Func{
-		types.NewFunc(token.NoPos, pkg, "Deadline", deadlineSig()),
-		types.NewFunc(token.NoPos, pkg, "Done", doneSig()),
-		types.NewFunc(token.NoPos, pkg, "Err", errSig()),
-		types.NewFunc(token.NoPos, pkg, "Value", valueSig()),
+	// buildssa runs without InstantiateGenerics, so the benchmark measures the
+	// SSA shape the analyzer actually sees.
+	program, ssaPackages := ssautil.AllPackages(packagesUnderTest, ssa.BuilderMode(0))
+	program.Build()
+	ssaPackage := ssaPackages[0]
+	fn, ok := ssaPackage.Members["largeAliasCFG"].(*ssa.Function)
+	if !ok {
+		b.Fatal("largeAliasCFG SSA function not found")
 	}
-	iface := types.NewInterfaceType(ifaceMethods, nil)
-	iface.Complete()
-
-	// Build the named type with a separate set of Func objects (same signatures,
-	// different pointers) so types.Implements must compare signatures rather
-	// than short-circuit on pointer identity.
-	tn := types.NewNamed(types.NewTypeName(token.NoPos, pkg, "MyCtx", nil), types.NewStruct(nil, nil), nil)
-	for _, name := range []string{"Deadline", "Done", "Err", "Value"} {
-		var sig *types.Signature
-		switch name {
-		case "Deadline":
-			sig = deadlineSig()
-		case "Done":
-			sig = doneSig()
-		case "Err":
-			sig = errSig()
-		case "Value":
-			sig = valueSig()
-		}
-		tn.AddMethod(types.NewFunc(token.NoPos, pkg, name, sig))
+	pass := &analysis.Pass{
+		Fset:      packagesUnderTest[0].Fset,
+		Files:     packagesUnderTest[0].Syntax,
+		Pkg:       packagesUnderTest[0].Types,
+		TypesInfo: packagesUnderTest[0].TypesInfo,
 	}
+	dataflow := newEngine(pass, &buildssa.SSA{Pkg: ssaPackage, SrcFuncs: []*ssa.Function{fn}}, nil)
 
-	st := &state{contextIface: iface}
-
-	b.ResetTimer()
+	b.ReportAllocs()
 	for b.Loop() {
-		_ = st.isContextType(tn)
+		dataflow.solve(fn)
 	}
 }

@@ -1,4 +1,3 @@
-// Tests for the zerologctx analyzer
 package zerologctx
 
 import (
@@ -6,283 +5,234 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"golang.org/x/tools/go/analysis/analysistest"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/ssa"
 )
 
-// TestAnalyzer runs the analyzer against test cases in the testdata directory.
-// It verifies that the analyzer correctly identifies missing Ctx() calls
-// in zerolog event chains.
 func TestAnalyzer(t *testing.T) {
-	// Get the test data directory
-	testdata := analysistest.TestData()
-
-	// Run the analyzer on the test packages. Every package whose fixtures are
-	// meant to assert something must be listed: analysistest checks `want`
-	// comments only in the packages named here, and runs the rest purely as
-	// dependencies.
-	//
-	// logonlypkg imports only a zerolog sub-package; wrappkg is both a
-	// dependency of wrapperconsumer and the source of the exported ctxCarrier
-	// facts, whose `want` annotations pin the exported/unexported split;
-	// wrapperconsumer reaches *zerolog.Event via a local wrapper without
-	// directly importing zerolog and consumes those facts; noctxpkg has
-	// neither zerolog nor "context" in its import graph and must be skipped
-	// without diagnostics or errors; scopepkg pins the context-availability
-	// gate (no reachable context — no diagnostic); deepchainpkg pins fixpoint
-	// convergence for a dependency chain deeper than any fixed pass budget.
-	analysistest.Run(t, testdata, Analyzer, "testpkg", "logonlypkg", "wrappkg", "wrapperconsumer", "noctxpkg", "scopepkg", "deepchainpkg")
+	analysistest.Run(t, analysistest.TestData(), Analyzer, "./strictpkg", "./summaryprovider", "./summaryconsumer")
 }
 
-// TestSuggestedFixes verifies the suggested-fix output end-to-end: candidate
-// selection in reachableCtx (ctx-name preference, nearest-preceding choice,
-// skipping variables that only ever hold nil, address-taking for
-// pointer-receiver context types) and the TextEdit insertion point.
 func TestSuggestedFixes(t *testing.T) {
-	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "fixpkg", "pkgctxpkg")
+	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "./fixpkg")
 }
 
-// TestFactTableJoin pins the property collectFacts' termination rests on:
-// writes at one position join rather than overwrite, so the table only ever
-// ascends. token.Pos does not uniquely identify a write site — Go allows the
-// same assignment target twice in one statement, and an ExprStmt shares its
-// position with a composite literal it starts with — so same-position
-// collisions are reachable from ordinary code, and an overwrite would let a
-// later write undo an earlier one and the fixpoint loop spin.
-func TestFactTableJoin(t *testing.T) {
-	zl := types.NewPackage("github.com/rs/zerolog", "zerolog")
-	logger := types.NewNamed(types.NewTypeName(token.NoPos, zl, "Logger", nil), types.NewStruct(nil, nil), nil)
-	obj := types.NewVar(token.NoPos, zl, "l", logger)
-	const pos = token.Pos(10)
-
-	tbl := newFactTable()
-	tbl.set(obj, pos, true)
-	writes := tbl.writes
-
-	tbl.set(obj, pos, false)
-	if !tbl.entries[obj][pos] {
-		t.Error("a false write at an occupied position cleared the context fact; writes must join")
-	}
-	if tbl.writes != writes {
-		t.Errorf("a write that changed nothing counted as progress: writes %d -> %d", writes, tbl.writes)
-	}
-
-	// The reverse order must reach the same state, and must count as progress
-	// so the fixpoint loop runs another pass.
-	tbl2 := newFactTable()
-	tbl2.set(obj, pos, false)
-	writes = tbl2.writes
-	tbl2.set(obj, pos, true)
-	if !tbl2.entries[obj][pos] {
-		t.Error("a context fact did not supersede an earlier contextless write at the same position")
-	}
-	if tbl2.writes == writes {
-		t.Error("an ascending write was not counted as progress; the fixpoint loop would stop early")
-	}
-}
-
-// TestSuggestedFixesCompile type-checks fixpkg.go.golden — the source
-// analysistest produces by applying every suggested fix — against the same
-// GOPATH-style testdata tree the analyzer runs on.
-//
-// TestSuggestedFixes only proves the fixed text is the text we expected; it
-// says nothing about whether that text compiles. Three separate classes of
-// broken fix (a candidate name shadowed at the call site, a value whose
-// context methods use pointer receivers, a blank receiver field) shipped
-// under a green golden comparison. Any fix that does not type-check now fails
-// here.
 func TestSuggestedFixesCompile(t *testing.T) {
 	testdata := analysistest.TestData()
-	// Every package TestSuggestedFixes drives must appear here, or its fixes
-	// are compared as text and never compiled.
-	for _, pkg := range []string{"fixpkg", "pkgctxpkg"} {
-		t.Run(pkg, func(t *testing.T) {
-			dir := filepath.Join(testdata, "src", pkg)
-			fixed, err := os.ReadFile(filepath.Join(dir, pkg+".go.golden"))
-			if err != nil {
-				t.Fatalf("read golden: %v", err)
-			}
+	dir := filepath.Join(testdata, "fixpkg")
+	fixed, err := os.ReadFile(filepath.Join(dir, "fix.go.golden"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs, err := filepath.Abs(filepath.Join(dir, "fix.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packagesUnderTest, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+			packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedDeps,
+		Dir: testdata,
+		Env: append(os.Environ(), "GOWORK=off"),
+		Overlay: map[string][]byte{
+			abs: fixed,
+		},
+	}, "./fixpkg")
+	if err != nil {
+		t.Fatalf("load fixed package: %v", err)
+	}
+	if len(packagesUnderTest) != 1 {
+		t.Fatalf("loaded %d packages, want 1", len(packagesUnderTest))
+	}
+	for _, loadError := range packagesUnderTest[0].Errors {
+		t.Errorf("source with all suggested fixes applied does not compile: %v", loadError)
+	}
+}
 
-			cfg := &packages.Config{
-				Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
-					packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedDeps,
-				Dir: testdata,
-				// GOPATH mode, matching analysistest's own loader.
-				Env: append(os.Environ(), "GOPATH="+testdata, "GO111MODULE=off", "GOWORK=off"),
-				Overlay: map[string][]byte{
-					filepath.Join(dir, pkg+".go"): fixed,
-				},
-			}
-			pkgs, err := packages.Load(cfg, pkg)
-			if err != nil {
-				t.Fatalf("load %s with suggested fixes applied: %v", pkg, err)
-			}
-			if len(pkgs) != 1 {
-				t.Fatalf("loaded %d packages, want 1", len(pkgs))
-			}
-			if pkgs[0].Name == "" {
-				t.Fatalf("%s failed to load at all: %v", pkg, pkgs[0].Errors)
-			}
-			for _, e := range pkgs[0].Errors {
-				t.Errorf("source with suggested fixes applied does not compile: %v", e)
+func TestJoinState(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b ctxState
+		want ctxState
+	}{
+		{"bottom", stateUnreachable, stateHasContext, stateHasContext},
+		{"same", stateNoContext, stateNoContext, stateNoContext},
+		{"conflict", stateHasContext, stateNoContext, stateUnknown},
+		{"unknown", stateHasContext, stateUnknown, stateUnknown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := joinState(test.a, test.b); got != test.want {
+				t.Fatalf("joinState(%s, %s) = %s, want %s", test.a, test.b, got, test.want)
 			}
 		})
 	}
 }
 
-// TestIsContextType directly tests context-interface satisfaction against
-// synthetic go/types constructs, covering shapes the testdata fixtures cannot
-// express: a type whose methods have the right names but the wrong signatures,
-// and non-named types. The addressableContext half of isContextType — a value
-// whose type satisfies context.Context only through its pointer — is covered
-// end-to-end by fixpkg, which pins the resulting &v fix text.
-func TestIsContextType(t *testing.T) {
-	// Build a minimal context.Context interface: Deadline, Done, Err, Value.
-	pkg := types.NewPackage("ctxtest", "ctxtest")
-	emptySig := types.NewSignatureType(nil, nil, nil, nil, nil, false)
+func TestJoinFrameTreatsMissingMemoryAsUnknown(t *testing.T) {
+	location := memoryLocation{root: &ssa.Alloc{}}
+	safe := newFrame()
+	safe.memory[location] = abstractValue{kind: kindLogger, state: stateHasContext}
 
-	// Correct method signatures matching context.Context.
-	timePkg := types.NewPackage("time", "time")
-	timeType := types.NewNamed(types.NewTypeName(token.NoPos, timePkg, "Time", nil), types.NewStruct(nil, nil), nil)
-	deadlineSig := types.NewSignatureType(nil, nil, nil, nil,
-		types.NewTuple(
-			types.NewVar(token.NoPos, nil, "", timeType),
-			types.NewVar(token.NoPos, nil, "", types.Typ[types.Bool]),
-		), false)
-	doneSig := types.NewSignatureType(nil, nil, nil, nil,
-		types.NewTuple(types.NewVar(token.NoPos, nil, "", types.NewChan(types.RecvOnly, types.NewStruct(nil, nil)))),
-		false)
-	errSig := types.NewSignatureType(nil, nil, nil, nil,
-		types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("error").Type())),
-		false)
-	valueSig := types.NewSignatureType(nil, nil, nil,
-		types.NewTuple(types.NewVar(token.NoPos, nil, "key", types.Universe.Lookup("any").Type())),
-		types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Universe.Lookup("any").Type())),
-		false)
-
-	iface := types.NewInterfaceType([]*types.Func{
-		types.NewFunc(token.NoPos, pkg, "Deadline", deadlineSig),
-		types.NewFunc(token.NoPos, pkg, "Done", doneSig),
-		types.NewFunc(token.NoPos, pkg, "Err", errSig),
-		types.NewFunc(token.NoPos, pkg, "Value", valueSig),
-	}, nil)
-	iface.Complete()
-
-	st := &state{contextIface: iface}
-
-	// Helper to build a named struct type with the given methods.
-	namedWith := func(name string, methods ...*types.Func) *types.Named {
-		tn := types.NewNamed(types.NewTypeName(token.NoPos, pkg, name, nil), types.NewStruct(nil, nil), nil)
-		for _, m := range methods {
-			tn.AddMethod(m)
-		}
-		return tn
+	for _, test := range []struct {
+		name  string
+		left  *frame
+		right *frame
+	}{
+		{name: "missing first", left: newFrame(), right: safe},
+		{name: "missing second", left: safe.clone(), right: newFrame()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			joinFrame(test.left, test.right)
+			if got := test.left.memory[location].state; got != stateUnknown {
+				t.Fatalf("joined memory state = %s, want unknown", got)
+			}
+		})
 	}
-
-	t.Run("nil contextIface returns false", func(t *testing.T) {
-		nilSt := &state{contextIface: nil}
-		if nilSt.isContextType(types.Typ[types.String]) {
-			t.Error("isContextType with nil contextIface should return false")
-		}
-	})
-
-	t.Run("nil type returns false", func(t *testing.T) {
-		if st.isContextType(nil) {
-			t.Error("isContextType(nil) should return false")
-		}
-	})
-
-	t.Run("map type returns false", func(t *testing.T) {
-		mapType := types.NewMap(types.Typ[types.String], types.Universe.Lookup("any").Type())
-		if st.isContextType(mapType) {
-			t.Error("map type should not satisfy context.Context")
-		}
-	})
-
-	t.Run("wrong method signatures returns false", func(t *testing.T) {
-		// Struct has correct method names but all return nothing (wrong signatures).
-		wrongType := namedWith("WrongCtx",
-			types.NewFunc(token.NoPos, pkg, "Deadline", emptySig),
-			types.NewFunc(token.NoPos, pkg, "Done", emptySig),
-			types.NewFunc(token.NoPos, pkg, "Err", emptySig),
-			types.NewFunc(token.NoPos, pkg, "Value", emptySig),
-		)
-		if st.isContextType(wrongType) {
-			t.Error("type with wrong method signatures should not satisfy context.Context")
-		}
-	})
-
-	t.Run("correct implementation returns true", func(t *testing.T) {
-		goodType := namedWith("GoodCtx",
-			types.NewFunc(token.NoPos, pkg, "Deadline", deadlineSig),
-			types.NewFunc(token.NoPos, pkg, "Done", doneSig),
-			types.NewFunc(token.NoPos, pkg, "Err", errSig),
-			types.NewFunc(token.NoPos, pkg, "Value", valueSig),
-		)
-		if !st.isContextType(goodType) {
-			t.Error("type with correct method signatures should satisfy context.Context")
-		}
-	})
-
-	t.Run("pointer to correct implementation returns true", func(t *testing.T) {
-		goodType := namedWith("GoodCtxPtr",
-			types.NewFunc(token.NoPos, pkg, "Deadline", deadlineSig),
-			types.NewFunc(token.NoPos, pkg, "Done", doneSig),
-			types.NewFunc(token.NoPos, pkg, "Err", errSig),
-			types.NewFunc(token.NoPos, pkg, "Value", valueSig),
-		)
-		if !st.isContextType(types.NewPointer(goodType)) {
-			t.Error("pointer to type with correct method signatures should satisfy context.Context")
-		}
-	})
 }
 
-// TestAnalyzerHelpers tests the helper functions used by the analyzer.
-func TestAnalyzerHelpers(t *testing.T) {
-	// Note: isContextType is directly tested in TestIsContextType above with
-	// synthetic go/types constructs that cover negative cases not expressible
-	// in testdata fixtures.
-
-	// Test the isNoLintComment function
-	t.Run("isNoLintComment", func(t *testing.T) {
-		testCases := []struct {
-			comment  string
-			linter   string
-			expected bool
-		}{
-			{"//nolint:zerologctx", "zerologctx", true},
-			{"// nolint:zerologctx", "zerologctx", true},
-			{"//nolint: zerologctx", "zerologctx", true},
-			{"// nolint: zerologctx", "zerologctx", true},
-			{"//   nolint: zerologctx", "zerologctx", true},
-			{"//nolint:linter1,zerologctx,linter2", "zerologctx", true},
-			{"//nolint:linter1, zerologctx, linter2", "zerologctx", true},
-			{"//   nolint: another1,zerologctx,another2", "zerologctx", true},
-			{"//   nolint: another1, zerologctx, another2", "zerologctx", true},
-			{"//nolint:otherlinter", "zerologctx", false},
-			{"//nolint:linter1,linter2", "zerologctx", false},
-			{"// just a comment", "zerologctx", false},
-			{"//nolint", "zerologctx", true},                       // bare nolint suppresses all linters
-			{"// nolint", "zerologctx", true},                      // bare nolint with leading space
-			{"//nolint:all", "zerologctx", true},                   // explicit all
-			{"//nolint:zerologctx // because", "zerologctx", true}, // trailing reason
-			{"//nolint:l1,zerologctx // because", "zerologctx", true},
-			{"//nolint:", "zerologctx", false}, // empty linter list
-			// Edge cases: malformed directives
-			{"//nolint:ZerolOGCTX", "zerologctx", false},             // case sensitive linter names
-			{"//nolint // reason without colon", "zerologctx", true}, // bare nolint is valid
-			{"/* nolint:zerologctx */", "zerologctx", false},         // block comments are not nolint directives
+func TestStateStrings(t *testing.T) {
+	for state, want := range map[ctxState]string{
+		stateUnreachable: "unreachable",
+		stateHasContext:  "has-context",
+		stateNoContext:   "no-context",
+		stateUnknown:     "unknown",
+	} {
+		if got := state.String(); got != want {
+			t.Errorf("state %d string = %q, want %q", state, got, want)
 		}
+	}
+}
 
-		for _, tc := range testCases {
-			t.Run(tc.comment, func(t *testing.T) {
-				got := isNoLintComment(tc.comment, tc.linter)
-				if got != tc.expected {
-					t.Errorf("isNoLintComment(%q, %q) = %v, want %v", tc.comment, tc.linter, got, tc.expected)
+func TestSummaryFromFactClampsStatesOutsideTheLattice(t *testing.T) {
+	fact := functionSummaryFact{
+		Results:      []ctxState{stateHasContext, 9},
+		ParamEffects: []ctxState{stateUnreachable, stateNoContext, 200},
+	}
+	summary := summaryFromFact(fact)
+	if want := []ctxState{stateHasContext, stateUnknown}; !slices.Equal(summary.results, want) {
+		t.Errorf("results = %d, want %d", summary.results, want)
+	}
+	if want := []ctxState{stateUnreachable, stateNoContext, stateUnknown}; !slices.Equal(summary.effects, want) {
+		t.Errorf("effects = %d, want %d", summary.effects, want)
+	}
+}
+
+func TestJoinStateIsALattice(t *testing.T) {
+	states := []ctxState{stateUnreachable, stateHasContext, stateNoContext, stateUnknown}
+	for _, a := range states {
+		if got := joinState(a, a); got != a {
+			t.Errorf("joinState(%s, %s) = %s, want idempotent", a, a, got)
+		}
+		if got := joinState(stateUnreachable, a); got != a {
+			t.Errorf("joinState(unreachable, %s) = %s, want %s: bottom must be the identity", a, got, a)
+		}
+		if got := joinState(stateUnknown, a); got != stateUnknown {
+			t.Errorf("joinState(unknown, %s) = %s, want unknown: top must absorb", a, got)
+		}
+		for _, b := range states {
+			if joinState(a, b) != joinState(b, a) {
+				t.Errorf("joinState(%s, %s) is not commutative", a, b)
+			}
+			for _, c := range states {
+				left, right := joinState(joinState(a, b), c), joinState(a, joinState(b, c))
+				if left != right {
+					t.Errorf("joinState is not associative on (%s, %s, %s): %s vs %s", a, b, c, left, right)
 				}
-			})
+			}
 		}
-	})
+	}
+}
+
+func TestJoinValueWidensInsteadOfCollapsing(t *testing.T) {
+	logger := abstractValue{kind: kindLogger, state: stateNoContext}
+	event := abstractValue{kind: kindEvent, state: stateHasContext}
+	nilEvent := abstractValue{kind: kindEvent, state: stateNoContext, nilCtx: true}
+	located := abstractValue{
+		kind: kindEvent, state: stateUnreachable,
+		locs: map[eventLocation]struct{}{{value: &ssa.Alloc{}}: {}},
+	}
+	aggregate := abstractValue{elems: []abstractValue{logger, event}}
+	values := []abstractValue{
+		{}, topValue, logger, event, nilEvent, located, aggregate,
+		{kind: kindBuilder, state: stateUnknown},
+	}
+	for _, a := range values {
+		for _, b := range values {
+			if !equalValue(joinValue(a, b), joinValue(b, a)) {
+				t.Errorf("joinValue(%v, %v) is not commutative", a, b)
+			}
+			for _, c := range values {
+				left, right := joinValue(joinValue(a, b), c), joinValue(a, joinValue(b, c))
+				if !equalValue(left, right) {
+					t.Errorf("joinValue is not associative on (%v, %v, %v): %v vs %v", a, b, c, left, right)
+				}
+			}
+		}
+	}
+	if joined := joinValue(logger, event); joined.state != stateUnknown {
+		t.Fatalf("joining incomparable kinds gave %s, want unknown: widening must not collapse to the bottom", joined.state)
+	}
+	if joinValue(nilEvent, abstractValue{kind: kindEvent, state: stateNoContext}).nilCtx {
+		t.Error("nilCtx is a must-property: one path without a nil Ctx clears it")
+	}
+	other := abstractValue{elems: []abstractValue{event, logger}}
+	if joined := joinValue(aggregate, other); joined.elems[0].state != stateUnknown {
+		t.Errorf("aggregate element joined to %s, want unknown: elements must be joined pointwise", joined.elems[0].state)
+	}
+	if !joinValue(located, unknownValue(kindEvent)).partialLocs {
+		t.Error("joining in a value with no identity must mark the location set partial")
+	}
+	if _, ok := joinValue(located, located).mustEvent(); !ok {
+		t.Error("a complete singleton location set must stay a must-alias")
+	}
+}
+
+func TestEffectiveStateFailsClosedAtTheLatticeBottom(t *testing.T) {
+	f := newFrame()
+	location := eventLocation{value: &ssa.Alloc{}}
+	f.events[location] = eventState{state: stateUnreachable}
+	for name, value := range map[string]abstractValue{
+		"logger":        {kind: kindLogger, state: stateUnreachable},
+		"builder":       {kind: kindBuilder, state: stateUnreachable},
+		"event":         {kind: kindEvent, state: stateUnreachable},
+		"located event": {kind: kindEvent, state: stateUnreachable, locs: map[eventLocation]struct{}{location: {}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := value.effectiveState(f); got != stateUnknown {
+				t.Fatalf("effectiveState = %s, want unknown: a tracked value at the bottom proves nothing", got)
+			}
+		})
+	}
+	if got := (abstractValue{state: stateUnreachable}).effectiveState(f); got != stateUnreachable {
+		t.Fatalf("effectiveState of an untracked value = %s, want unreachable", got)
+	}
+}
+
+func TestZerologNamedUnaliases(t *testing.T) {
+	pkg := types.NewPackage(zerologPkgPath, "zerolog")
+	named := types.NewNamed(types.NewTypeName(token.NoPos, pkg, "Event", nil), types.NewStruct(nil, nil), nil)
+	aliasPkg := types.NewPackage("example.com/app", "app")
+	alias := types.NewAlias(types.NewTypeName(token.NoPos, aliasPkg, "Event", nil), named)
+	if !zerologNamed(types.NewPointer(alias), "Event") {
+		t.Fatal("pointer to an alias of zerolog.Event was not recognised")
+	}
+}
+
+func TestIsNoLintComment(t *testing.T) {
+	for _, text := range []string{
+		"//nolint", "//nolint:all", "//nolint:zerologctx", "//nolint:l1, zerologctx // reason",
+	} {
+		if !isNoLintComment(text, "zerologctx") {
+			t.Errorf("%q did not suppress zerologctx", text)
+		}
+	}
+	for _, text := range []string{"// ordinary", "//nolint:other", "//nolintfoo", "/*nolint:zerologctx*/"} {
+		if isNoLintComment(text, "zerologctx") {
+			t.Errorf("%q unexpectedly suppressed zerologctx", text)
+		}
+	}
 }
