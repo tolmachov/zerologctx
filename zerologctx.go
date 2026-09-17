@@ -13,11 +13,13 @@ package zerologctx
 
 import (
 	"fmt"
+	"go/ast"
 	"go/types"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/buildssa"
+	"golang.org/x/tools/go/analysis/passes/ctrlflow"
+	"golang.org/x/tools/go/ssa"
 )
 
 // Analyzer is the zerologctx analyzer. See its Doc field for the user-facing
@@ -46,7 +48,7 @@ line the call spans or on a line of its own directly above it. Bare //nolint
 and //nolint:all also suppress.
 
 The analyzer has no configuration.`,
-	Requires:  []*analysis.Analyzer{buildssa.Analyzer},
+	Requires:  []*analysis.Analyzer{ctrlflow.Analyzer},
 	Run:       run,
 	FactTypes: []analysis.Fact{new(functionSummaryFact)},
 }
@@ -134,13 +136,21 @@ func renderEffects(effects []ctxState) []string {
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	ssaResult, ok := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-	if !ok {
-		return nil, fmt.Errorf("zerologctx: buildssa analyzer result missing")
-	}
 	hasZerolog, contextIface := scanImports(pass.Pkg)
 	if !hasZerolog {
 		return nil, nil
+	}
+	// Being in zerolog's import graph is not the same as using it. Most
+	// packages of a large repository never name a zerolog value, and building
+	// SSA for them is what made the analyzer unaffordable: it is by far the
+	// most expensive thing this analyzer does, and for those packages it
+	// produces nothing to report and nothing to export.
+	if !usesZerologValues(pass.TypesInfo) {
+		return nil, nil
+	}
+	srcFuncs, err := buildPackageSSA(pass)
+	if err != nil {
+		return nil, err
 	}
 	// contextIface may be nil: export data records only the imports a package's
 	// API needs, so context can be absent from the graph of a package that
@@ -149,11 +159,72 @@ func run(pass *analysis.Pass) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	engine := newEngine(pass, ssaResult, sources)
+	engine := newEngine(pass, srcFuncs, sources)
 	engine.solveSummaries()
 	engine.report()
 	engine.exportSummaries()
 	return nil, nil
+}
+
+// usesZerologValues reports whether the package's own code manipulates a
+// zerolog Logger, Event or Context. It asks about types rather than imports,
+// because a package can use a value obtained from elsewhere without naming
+// zerolog itself.
+func usesZerologValues(info *types.Info) bool {
+	for _, typeAndValue := range info.Types {
+		if kindOf(typeAndValue.Type) != kindOther {
+			return true
+		}
+	}
+	for _, object := range info.Defs {
+		if object != nil && kindOf(object.Type()) != kindOther {
+			return true
+		}
+	}
+	return false
+}
+
+// buildPackageSSA builds SSA for this package alone. Requiring buildssa would
+// hand the same job to the driver, which then does it for every package in the
+// graph whether or not this analyzer needs it.
+func buildPackageSSA(pass *analysis.Pass) ([]*ssa.Function, error) {
+	cfgs, ok := pass.ResultOf[ctrlflow.Analyzer].(*ctrlflow.CFGs)
+	if !ok {
+		return nil, fmt.Errorf("zerologctx: ctrlflow analyzer result missing")
+	}
+	program := ssa.NewProgram(pass.Fset, ssa.BuilderMode(0))
+	// Without this, code after a call that can only panic looks reachable.
+	program.SetNoReturn(cfgs.NoReturn)
+	for _, imported := range pass.Pkg.Imports() {
+		program.CreatePackage(imported, nil, nil, true)
+	}
+	ssaPackage := program.CreatePackage(pass.Pkg, pass.Files, pass.TypesInfo, false)
+	ssaPackage.Build()
+
+	var funcs []*ssa.Function
+	var addWithAnons func(*ssa.Function)
+	addWithAnons = func(fn *ssa.Function) {
+		funcs = append(funcs, fn)
+		for _, anon := range fn.AnonFuncs {
+			addWithAnons(anon)
+		}
+	}
+	for _, file := range pass.Files {
+		for _, decl := range file.Decls {
+			decl, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			object, ok := pass.TypesInfo.Defs[decl.Name].(*types.Func)
+			if !ok {
+				continue
+			}
+			if fn := program.FuncValue(object); fn != nil {
+				addWithAnons(fn)
+			}
+		}
+	}
+	return funcs, nil
 }
 
 func scanImports(pkg *types.Package) (bool, *types.Interface) {

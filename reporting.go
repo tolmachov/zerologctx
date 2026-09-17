@@ -72,7 +72,7 @@ func newSourceIndex(pass *analysis.Pass, contextIface *types.Interface) (*source
 }
 
 func (e *engine) report() {
-	for _, fn := range e.ssa.SrcFuncs {
+	for _, fn := range e.srcFuncs {
 		for _, finding := range e.findings[fn] {
 			call := e.sources.callAt(finding.pos)
 			if finding.state == stateHasContext || e.sources.hasNoLint(call) {

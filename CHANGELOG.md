@@ -49,7 +49,9 @@ First public release. Nothing has shipped before it, so everything below is new.
 
 - The analyzer has no settings. A plugin `settings` block is rejected rather
   than ignored.
-- It requires only `buildssa`, and needs `LoadModeTypesInfo`.
+- It requires only `ctrlflow`, and needs `LoadModeTypesInfo`. SSA is built
+  per package by the analyzer itself, and only for packages that actually
+  handle a zerolog value.
 - `context.Context` need not be reachable from a package's import graph. When
   it is absent, diagnostics are still emitted; only suggested fixes are
   withheld.

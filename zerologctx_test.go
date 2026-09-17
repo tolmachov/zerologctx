@@ -14,7 +14,8 @@ import (
 )
 
 func TestAnalyzer(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), Analyzer, "./strictpkg", "./summaryprovider", "./summaryconsumer")
+	analysistest.Run(t, analysistest.TestData(), Analyzer,
+		"./strictpkg", "./summaryprovider", "./summaryconsumer", "./indirectconsumer")
 }
 
 func TestSuggestedFixes(t *testing.T) {

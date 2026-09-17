@@ -6,7 +6,6 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/analysistest"
-	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
@@ -59,8 +58,8 @@ func BenchmarkSSAEngineLargeAliasCFG(b *testing.B) {
 		b.Fatalf("load strictpkg: %v", loadError)
 	}
 
-	// buildssa runs without InstantiateGenerics, so the benchmark measures the
-	// SSA shape the analyzer actually sees.
+	// The analyzer builds SSA without InstantiateGenerics, so the benchmark
+	// measures the SSA shape it actually sees.
 	program, ssaPackages := ssautil.AllPackages(packagesUnderTest, ssa.BuilderMode(0))
 	program.Build()
 	ssaPackage := ssaPackages[0]
@@ -74,7 +73,7 @@ func BenchmarkSSAEngineLargeAliasCFG(b *testing.B) {
 		Pkg:       packagesUnderTest[0].Types,
 		TypesInfo: packagesUnderTest[0].TypesInfo,
 	}
-	dataflow := newEngine(pass, &buildssa.SSA{Pkg: ssaPackage, SrcFuncs: []*ssa.Function{fn}}, nil)
+	dataflow := newEngine(pass, []*ssa.Function{fn}, nil)
 
 	b.ReportAllocs()
 	for b.Loop() {

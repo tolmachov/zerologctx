@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -185,19 +184,31 @@ func newFrame() *frame {
 
 func (f *frame) clone() *frame {
 	r := newFrame()
-	for k, v := range f.values {
-		r.values[k] = v
-	}
-	for k, v := range f.memory {
-		r.memory[k] = v
-	}
-	for k, v := range f.events {
-		r.events[k] = v
-	}
-	for k, v := range f.writes {
-		r.writes[k] = v
-	}
+	r.resetFrom(f)
 	return r
+}
+
+// resetFrom refills the frame from src, reusing the maps it already allocated.
+// A block is re-entered many times before the worklist settles and almost
+// every visit ends up changing nothing, so allocating a frame per visit was
+// the analyzer's single largest source of garbage.
+func (f *frame) resetFrom(src *frame) {
+	clear(f.values)
+	clear(f.memory)
+	clear(f.events)
+	clear(f.writes)
+	for k, v := range src.values {
+		f.values[k] = v
+	}
+	for k, v := range src.memory {
+		f.memory[k] = v
+	}
+	for k, v := range src.events {
+		f.events[k] = v
+	}
+	for k, v := range src.writes {
+		f.writes[k] = v
+	}
 }
 
 func joinFrame(dst, src *frame) bool {
@@ -306,9 +317,9 @@ type collector struct {
 }
 
 type engine struct {
-	pass    *analysis.Pass
-	ssa     *buildssa.SSA
-	sources *sourceIndex
+	pass     *analysis.Pass
+	srcFuncs []*ssa.Function
+	sources  *sourceIndex
 	// findings are collected as each component settles, when its callees'
 	// summaries are already final, so no function is solved twice.
 	findings map[*ssa.Function][]sinkFinding
@@ -319,19 +330,19 @@ type engine struct {
 	local map[*ssa.Function]functionSummary
 }
 
-func newEngine(pass *analysis.Pass, result *buildssa.SSA, sources *sourceIndex) *engine {
+func newEngine(pass *analysis.Pass, srcFuncs []*ssa.Function, sources *sourceIndex) *engine {
 	return &engine{
-		pass: pass, ssa: result, sources: sources,
+		pass: pass, srcFuncs: srcFuncs, sources: sources,
 		findings: make(map[*ssa.Function][]sinkFinding), later: make(map[*ssa.Function][]ssa.CallInstruction),
 		local: make(map[*ssa.Function]functionSummary),
 	}
 }
 
 func (e *engine) solveSummaries() {
-	for _, fn := range e.ssa.SrcFuncs {
+	for _, fn := range e.srcFuncs {
 		e.local[fn] = emptySummary(fn)
 	}
-	for _, component := range summarySCCs(e.ssa.SrcFuncs) {
+	for _, component := range summarySCCs(e.srcFuncs) {
 		frames := e.solveComponent(component)
 		for _, fn := range component {
 			e.findings[fn] = e.collectFindings(fn, frames[fn])
@@ -496,10 +507,10 @@ func functionValue(value ssa.Value) *ssa.Function {
 }
 
 // exportSummaries publishes the proven postconditions of this package's
-// exported functions. buildssa runs without InstantiateGenerics, so each source
+// exported functions. SSA is built without InstantiateGenerics, so each source
 // function appears once and its object identifies it uniquely.
 func (e *engine) exportSummaries() {
-	for _, fn := range e.ssa.SrcFuncs {
+	for _, fn := range e.srcFuncs {
 		obj, ok := fn.Object().(*types.Func)
 		if !ok || obj.Pkg() != e.pass.Pkg || !obj.Exported() {
 			continue
@@ -622,17 +633,21 @@ func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
 	in[fn.Blocks[0]] = entry
 	queue := []*ssa.BasicBlock{fn.Blocks[0]}
 	queued := map[*ssa.BasicBlock]bool{fn.Blocks[0]: true}
+	scratch := newFrame()
 	for len(queue) > 0 {
 		block := queue[0]
 		queue = queue[1:]
 		queued[block] = false
-		current := in[block].clone()
+		scratch.resetFrom(in[block])
 		for _, instruction := range block.Instrs {
-			e.transfer(block, instruction, current, out, nil)
+			e.transfer(block, instruction, scratch, out, nil)
 		}
-		if previous := out[block]; previous != nil && framesEqual(previous, current) {
+		if previous := out[block]; previous != nil && framesEqual(previous, scratch) {
 			continue
 		}
+		// The block's state changed, so this frame is kept and the scratch is
+		// needed again for the next visit.
+		current := scratch.clone()
 		out[block] = current
 		for _, successor := range block.Succs {
 			if in[successor] == nil {
@@ -647,6 +662,11 @@ func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
 			}
 		}
 	}
+	// Results and parameter effects are both read at the same moment — after
+	// the deferred and concurrent calls have taken effect — so each returning
+	// block's terminal frame is built once and both are derived from it.
+	effects := make([]ctxState, len(fn.Params))
+	written := make([]bool, len(fn.Params))
 	for _, block := range fn.Blocks {
 		current := out[block]
 		if current == nil || !blockReturns(block) {
@@ -665,27 +685,22 @@ func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
 				summary.results[idx] = joinState(summary.results[idx], e.value(terminal, value).latticeState(terminal))
 			}
 		}
-	}
-	for idx, param := range fn.Params {
-		kind := trackedPointerKind(param.Type())
-		if kind == kindOther {
-			continue
-		}
-		state, wrote := stateUnreachable, false
-		for block, current := range out {
-			if !blockReturns(block) {
+		for idx, param := range fn.Params {
+			kind := trackedPointerKind(param.Type())
+			if kind == kindOther {
 				continue
 			}
-			terminal := e.withLaterEffects(fn, current)
-			wrote = wrote || terminal.writes[param]
+			written[idx] = written[idx] || terminal.writes[param]
 			if kind == kindEvent {
-				state = joinState(state, terminal.events[eventLocation{value: param}].state)
+				effects[idx] = joinState(effects[idx], terminal.events[eventLocation{value: param}].state)
 			} else {
-				state = joinState(state, terminal.memory[memoryLocation{root: param}].latticeState(terminal))
+				effects[idx] = joinState(effects[idx], terminal.memory[memoryLocation{root: param}].latticeState(terminal))
 			}
 		}
-		if wrote {
-			summary.effects[idx] = state
+	}
+	for idx := range fn.Params {
+		if written[idx] {
+			summary.effects[idx] = effects[idx]
 		}
 	}
 	return summary, blockFrames{in: in, out: out}
@@ -694,14 +709,15 @@ func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
 func (e *engine) collectFindings(fn *ssa.Function, frames blockFrames) []sinkFinding {
 	in, out := frames.in, frames.out
 	sink := &collector{findings: make([]sinkFinding, 0), seen: make(map[*ssa.CallCommon]bool)}
+	scratch := newFrame()
 	for _, block := range fn.Blocks {
 		entry := in[block]
 		if entry == nil {
 			continue
 		}
-		current := entry.clone()
+		scratch.resetFrom(entry)
 		for _, instruction := range block.Instrs {
-			e.transfer(block, instruction, current, out, sink)
+			e.transfer(block, instruction, scratch, out, sink)
 		}
 	}
 
@@ -798,6 +814,19 @@ func blockTerminates(block *ssa.BasicBlock) bool {
 	}
 }
 
+// remember records what is known about an SSA register, but only when it says
+// something a plain lookup would not. A frame is copied once per block visit,
+// so entries that read back identically are pure weight: in generated code a
+// single function can hold thousands of conversions and phis over types the
+// analyzer does not track at all.
+func remember(current *frame, value ssa.Value, known abstractValue) {
+	if known.kind == kindOther && len(known.elems) == 0 && len(known.locs) == 0 && len(known.memLocs) == 0 {
+		delete(current.values, value)
+		return
+	}
+	current.values[value] = known
+}
+
 func (e *engine) transfer(block *ssa.BasicBlock, instruction ssa.Instruction, current *frame, predecessorOut map[*ssa.BasicBlock]*frame, sink *collector) {
 	switch instruction := instruction.(type) {
 	case *ssa.Store:
@@ -824,7 +853,7 @@ func (e *engine) transfer(block *ssa.BasicBlock, instruction ssa.Instruction, cu
 				if !ok {
 					value = e.loadAggregate(current, location, instruction.Type())
 				}
-				current.values[instruction] = value
+				remember(current, instruction, value)
 			}
 		}
 	case *ssa.Phi:
@@ -837,15 +866,15 @@ func (e *engine) transfer(block *ssa.BasicBlock, instruction ssa.Instruction, cu
 		if value.kind == kindOther && kindOf(instruction.Type()) != kindOther {
 			value = unknownValue(kindOf(instruction.Type()))
 		}
-		current.values[instruction] = value
+		remember(current, instruction, value)
 	case *ssa.ChangeType:
-		current.values[instruction] = e.value(current, instruction.X)
+		remember(current, instruction, e.value(current, instruction.X))
 	case *ssa.Convert:
-		current.values[instruction] = e.value(current, instruction.X)
+		remember(current, instruction, e.value(current, instruction.X))
 	case *ssa.ChangeInterface:
-		current.values[instruction] = e.value(current, instruction.X)
+		remember(current, instruction, e.value(current, instruction.X))
 	case *ssa.MakeInterface:
-		current.values[instruction] = e.value(current, instruction.X)
+		remember(current, instruction, e.value(current, instruction.X))
 	case *ssa.TypeAssert:
 		asserted := e.value(current, instruction.X)
 		if len(asserted.elems) != 0 {
@@ -853,23 +882,23 @@ func (e *engine) transfer(block *ssa.BasicBlock, instruction ssa.Instruction, cu
 			asserted = unknownValue(kindOf(instruction.AssertedType))
 		}
 		if instruction.CommaOk {
-			current.values[instruction] = abstractValue{elems: []abstractValue{asserted, topValue}}
+			remember(current, instruction, abstractValue{elems: []abstractValue{asserted, topValue}})
 			return
 		}
-		current.values[instruction] = asserted
+		remember(current, instruction, asserted)
 	case *ssa.Extract:
 		tuple := e.value(current, instruction.Tuple)
 		if instruction.Index < len(tuple.elems) {
-			current.values[instruction] = tuple.elems[instruction.Index]
+			remember(current, instruction, tuple.elems[instruction.Index])
 		} else if kindOf(instruction.Type()) != kindOther {
-			current.values[instruction] = unknownValue(kindOf(instruction.Type()))
+			remember(current, instruction, unknownValue(kindOf(instruction.Type())))
 		}
 	case *ssa.Field:
 		aggregate := e.value(current, instruction.X)
 		if instruction.Field < len(aggregate.elems) {
-			current.values[instruction] = aggregate.elems[instruction.Field]
+			remember(current, instruction, aggregate.elems[instruction.Field])
 		} else if kindOf(instruction.Type()) != kindOther {
-			current.values[instruction] = unknownValue(kindOf(instruction.Type()))
+			remember(current, instruction, unknownValue(kindOf(instruction.Type())))
 		}
 	case *ssa.Call:
 		e.handleCall(instruction, instruction.Common(), current, sink)
