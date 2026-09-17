@@ -13,9 +13,6 @@ jobs:
   test:
     name: Go ${{ matrix.go }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -53,14 +50,6 @@ jobs:
         run: |
           total="$(go tool cover -func=coverage.out | awk '/^total:/ { gsub(/%/, "", $3); print $3 }')"
           awk -v total="$total" 'BEGIN { if (total + 0 < 90) exit 1 }'
-
-      - name: Upload coverage (best effort)
-        if: matrix.go == '1.27.1'
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238
-        with:
-          file: ./coverage.out
-          fail_ci_if_error: false
-          use_oidc: true
 
   quality:
     name: Quality and security
