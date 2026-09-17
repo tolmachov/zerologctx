@@ -1,324 +1,82 @@
-# Contributing to zerologctx
+# Contributing
 
-Thank you for your interest in contributing to zerologctx! This document provides guidelines and instructions for contributing.
+`zerologctx` is a strict analyzer. A change is correct only when every reported
+safe result is proven for all reachable paths; uncertainty must remain a
+diagnostic.
 
-## Table of Contents
+## Prerequisites
 
-- [Code of Conduct](#code-of-conduct)
-- [Getting Started](#getting-started)
-- [Development Setup](#development-setup)
-- [Making Changes](#making-changes)
-- [Testing](#testing)
-- [Submitting Changes](#submitting-changes)
-- [Coding Standards](#coding-standards)
-- [Performance Considerations](#performance-considerations)
+- Go 1.26 or newer; CI builds on 1.26.1 and 1.27.1;
+- `staticcheck` v0.8.1;
+- `govulncheck` v1.8.0;
+- `golangci-lint` v2.13.2 when changing plugin integration.
 
-## Code of Conduct
-
-This project adheres to a code of conduct. By participating, you are expected to uphold this code. Please be respectful and constructive in all interactions.
-
-## Getting Started
-
-1. Fork the repository on GitHub
-2. Clone your fork locally
-3. Create a new branch for your changes
-4. Make your changes
-5. Test your changes
-6. Submit a pull request
-
-## Development Setup
-
-### Prerequisites
-
-- Go 1.26.0 or later
-- Git
-
-### Setup
+Install pinned tools:
 
 ```bash
-# Clone your fork
-git clone https://github.com/YOUR_USERNAME/zerologctx.git
-cd zerologctx
-
-# Add upstream remote
-git remote add upstream https://github.com/tolmachov/zerologctx.git
-
-# Install dependencies
-go mod download
-
-# Install development tools
-go install honnef.co/go/tools/cmd/staticcheck@latest
+go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
 ```
 
-### Building
+## Required verification
 
 ```bash
-# Build the CLI tool
-go build ./cmd/zerologctx
-
-# Install locally
-go install ./cmd/zerologctx
+test -z "$(gofmt -s -l .)"
+go mod tidy -diff
+go mod verify
+(cd testdata && go mod tidy -diff && go mod verify)
+go build ./...
+go vet ./...
+staticcheck ./...
+govulncheck ./...
+go test -race -covermode=atomic -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out
+./scripts/verify-plugin.sh
+go test -run '^$' -bench . -benchtime 1x ./...
 ```
 
-### Verifying the golangci-lint plugin
-
-The `plugin` package's unit tests pin the registration contract, but the wiring
-golangci-lint actually uses is only exercised by building a custom binary. Do
-this from a scratch directory when you touch `plugin/`:
-
-```bash
-mkdir -p /tmp/gcl && cd /tmp/gcl
-cat > .custom-gcl.yml <<EOF
-version: v2.13.2
-name: golangci-lint-zerologctx
-destination: /tmp/gcl/bin
-plugins:
-  - module: github.com/tolmachov/zerologctx
-    import: github.com/tolmachov/zerologctx/plugin
-    path: /path/to/your/zerologctx/checkout
-EOF
-golangci-lint custom
-```
-
-Then run `/tmp/gcl/bin/golangci-lint-zerologctx run` against a project that
-uses zerolog. Note golangci-lint's default `max-same-issues: 3` caps repeated
-diagnostics; pass `--max-same-issues=0` when comparing against the standalone
-CLI's output.
-
-This is deliberately not a CI step: it clones and builds golangci-lint from
-source, which is minutes of CI time for a surface that changes rarely.
-
-## Making Changes
-
-### Branch Naming
-
-Use descriptive branch names:
-- `feature/your-feature-name` - for new features
-- `fix/bug-description` - for bug fixes
-- `docs/documentation-update` - for documentation changes
-- `refactor/code-improvement` - for refactoring
-
-### Commit Messages
-
-Write clear commit messages that describe what changed and why:
-
-```
-Add support for custom terminal methods
-
-- Implement configurable terminal methods via flags
-- Update documentation with examples
-- Add tests for new functionality
-
-Fixes #123
-```
-
-Guidelines:
-- Use present tense ("Add feature" not "Added feature")
-- Keep first line under 72 characters
-- Add detailed description if needed
-- Reference issues when applicable
-
-## Testing
-
-### Running Tests
-
-```bash
-# Run all tests
-go test ./...
-
-# Run tests with coverage
-go test -cover ./...
-
-# Run tests with race detector
-go test -race ./...
-
-# Run specific test
-go test -v -run TestAnalyzer
-
-# Run benchmarks
-go test -bench=. -benchmem
-```
-
-### Writing Tests
-
-- Add test cases to `testdata/src/testpkg/` for integration tests
-- Use `// want "..."` comments to specify expected diagnostics
-- Add unit tests for helper functions in `zerologctx_test.go`
-- Include edge cases and error conditions
-- Ensure new features have corresponding tests
-
-Example test case:
-
-```go
-// testdata/src/testpkg/my_test.go
-func TestNewFeature() {
-    ctx := context.Background()
-
-    // Should trigger - missing context
-    log.Info().Msg("test") // want "zerolog event missing .Ctx\\(ctx\\).*"
-
-    // Should not trigger - has context
-    log.Info().Ctx(ctx).Msg("test")
-}
-```
-
-### Test Coverage
-
-Maintain test coverage above 90%. Check coverage with:
-
-```bash
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-```
-
-## Submitting Changes
-
-### Before Submitting
-
-1. **Run all tests**: `go test ./...`
-2. **Check formatting**: `gofmt -s -w .`
-3. **Run linters**:
-   ```bash
-   go vet ./...
-   staticcheck ./...
-   ```
-4. **Update documentation** if needed
-5. **Add/update tests** for your changes
-6. **Update CHANGELOG.md** with your changes
-
-### Pull Request Process
-
-1. Update your branch with the latest from `main`:
-   ```bash
-   git fetch upstream
-   git rebase upstream/main
-   ```
-
-2. Push your changes to your fork:
-   ```bash
-   git push origin your-branch-name
-   ```
-
-3. Create a pull request on GitHub with:
-   - Clear title describing the change
-   - Detailed description of what changed and why
-   - Link to any related issues
-   - Screenshots/examples if applicable
-
-4. Address review feedback:
-   - Make requested changes
-   - Push new commits (don't force push during review)
-   - Respond to comments
-
-5. After approval:
-   - Maintainer will merge your PR
-
-### Pull Request Checklist
-
-- [ ] Tests pass locally
-- [ ] Code is formatted (`gofmt -s`)
-- [ ] No linter warnings (`go vet`, `staticcheck`)
-- [ ] Tests added/updated for changes
-- [ ] Documentation updated if needed
-- [ ] CHANGELOG.md updated
-- [ ] Branch is up to date with main
-
-## Coding Standards
-
-### Go Style
-
-Follow standard Go conventions:
-- Use `gofmt` for formatting
-- Follow [Effective Go](https://golang.org/doc/effective_go)
-- Follow [Go Code Review Comments](https://github.com/golang/go/wiki/CodeReviewComments)
-
-### Documentation
-
-- Add godoc comments to all exported symbols
-- Explain complex logic with inline comments
-- Document edge cases and assumptions
-- Keep comments up to date with code
-
-### Code Organization
-
-- Keep functions focused and small (< 50 lines preferred)
-- Use descriptive variable names
-- Avoid deep nesting (max 3-4 levels)
-- Extract complex conditions into well-named functions
-
-### Error Handling
-
-- Check errors explicitly
-- Use defensive programming for AST traversal
-- Handle nil cases appropriately
-- Provide clear error messages to users
-
-## Performance Considerations
-
-### Optimization Guidelines
-
-- Profile before optimizing
-- Run benchmarks to measure impact
-- Consider algorithmic improvements first
-- Use caching/memoization where appropriate
-- Avoid premature optimization
-
-### Running Benchmarks
-
-```bash
-# Run all benchmarks
-go test -bench=. -benchmem
-
-# Compare before/after
-go test -bench=. -benchmem > old.txt
-# make changes
-go test -bench=. -benchmem > new.txt
-benchcmp old.txt new.txt
-```
-
-### Performance Goals
-
-- Analyzer should complete in < 1s for typical packages
-- Memory usage should be reasonable for large codebases
-- No significant performance regression in PRs
-
-## Architecture Notes
-
-### Key Components
-
-1. **Analyzer** (`zerologctx.go`): Main analysis engine
-   - Uses two-pass approach
-   - Tracks loggers and events with context
-   - Reports diagnostics for missing context
-
-2. **Type System**: Type checking and validation
-   - `isContextType()`: Validates context types
-   - `implementsContextInterface()`: Method set checking
-   - Handles custom types and pointers
-
-3. **Chain Analysis**: AST traversal
-   - `hasCtxInChain()`: Recursive chain walking
-   - Distinguishes Logger.Ctx() from Event.Ctx()
-   - Tracks context through variable assignments
-
-4. **Comment Parsing**: nolint directive support
-   - `isNoLintComment()`: Parses suppression directives
-   - Handles multiple formats and linters
-
-### Adding New Features
-
-When adding features, consider:
-- Does it fit the analyzer's purpose?
-- Can it be configurable?
-- What's the performance impact?
-- How to test it comprehensively?
-- Does documentation need updates?
-
-## Questions?
-
-If you have questions:
-- Open an issue on GitHub
-- Check existing issues and PRs
-- Read the documentation
-
-Thank you for contributing to zerologctx!
+Total statement coverage must remain at least 90 percent. Run the test and race
+suites on both supported Go patch versions before release.
+
+## Test layout
+
+Fixtures live in the independent module under `testdata/` and use the real,
+pinned `github.com/rs/zerolog v1.35.1`. Do not reintroduce a local zerolog stub.
+
+- `strictpkg` covers control flow, aliases, memory, sink forms, summaries, and
+  suppressions;
+- `summaryprovider` and `summaryconsumer` cover exported analysis facts;
+- `fixpkg` verifies suggested edits and recompiles the fully fixed source;
+- `pluginfixture` is executed by a real custom golangci-lint binary.
+
+Add regressions at the abstraction boundary that failed, not merely at a
+downstream symptom. Suggested fixes must be golden-tested and type-checked.
+Unsafe call forms must explicitly remain unchanged in the golden output.
+
+## Design constraints
+
+- Zerolog identity comes from canonical package paths and `go/types` objects,
+  after alias removal; do not match printed type strings.
+- The dataflow lattice is `unreachable`, `has-context`, `no-context`, and
+  `unknown`; joins are safe only when every reachable predecessor is safe.
+- Function summaries are solved per strongly connected component and may
+  export only proven postconditions.
+- Globals and receiver fields are opaque mutable storage. Do not add
+  package-wide positive-assignment shortcuts.
+- `invalidateEscape` is the single invalidation path, and it must stay closed
+  over all four ways an abstract value reaches state: a syntactic address, the
+  event identities in `locs`, the memory locations in `memLocs`, and everything
+  nested in `elems`. Following fewer of them preserves a proof the escape
+  destroyed.
+- A postcondition may only be written into a location proven to be the one the
+  call touched — a syntactic address, or a complete singleton `locs` set. A
+  may-alias set is widened, never updated.
+- The summary fixpoint terminates because the accumulator ascends, not because
+  it is capped. Every round joins into what is already known, so a slot moves
+  at most twice. Do not replace that join with an assignment.
+- Keep reporting and suggested-fix policy separate from SSA transfer logic.
+- There is no compatibility mode or configuration surface.
+
+Update [CHANGELOG.md](CHANGELOG.md) for user-visible behavior changes. Before a
+release, follow [RELEASING.md](RELEASING.md).

@@ -1,5 +1,9 @@
-// Command zerologctx is a static analysis tool that checks
-// that zerolog logging events include context via the Ctx() method.
+// Command zerologctx reports zerolog output operations that are not proven to
+// carry a context.Context. Run it over packages the way go vet is run:
+//
+//	zerologctx ./...
+//
+// See package github.com/tolmachov/zerologctx for the full contract.
 package main
 
 import (
@@ -9,6 +13,5 @@ import (
 )
 
 func main() {
-	// singlechecker runs a single analyzer as a command line tool
 	singlechecker.Main(zerologctx.Analyzer)
 }

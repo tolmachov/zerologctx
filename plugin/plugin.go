@@ -1,10 +1,8 @@
 // Package plugin registers zerologctx as a golangci-lint module plugin.
 //
 // golangci-lint v2 builds a custom binary that imports this package for its
-// registration side effect; see .custom-gcl.yml and the README. The v1
-// `-buildmode=plugin` entry point it replaces is gone: v1 plugins had to be
-// compiled against the exact golangci-lint toolchain and dependency versions,
-// and keeping a second, unsupported loading path alive helps nobody.
+// registration side effect. See the README for the host configuration, and
+// testdata/pluginfixture/custom-gcl.yml for the example CI actually builds.
 package plugin
 
 import (

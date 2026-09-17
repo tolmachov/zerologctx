@@ -1,0 +1,12 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - zerologctx
+  settings:
+    custom:
+      zerologctx:
+        type: module
+        description: Requires proven context on every zerolog output
+issues:
+  max-same-issues: 0

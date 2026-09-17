@@ -1,0 +1,7 @@
+version: v2.13.2
+name: golangci-lint-zerologctx
+destination: ./bin
+plugins:
+  - module: github.com/tolmachov/zerologctx
+    import: github.com/tolmachov/zerologctx/plugin
+    path: REPOSITORY_PATH
