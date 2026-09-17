@@ -13,6 +13,9 @@ jobs:
   test:
     name: Go ${{ matrix.go }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +60,7 @@ jobs:
         with:
           file: ./coverage.out
           fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
 
   quality:
     name: Quality and security
