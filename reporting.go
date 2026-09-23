@@ -13,7 +13,7 @@ import (
 type sourceIndex struct {
 	pass          *analysis.Pass
 	files         map[*token.File]*ast.File
-	lines         map[*ast.File]*lineIndex
+	lines         map[*token.File]*lineIndex
 	callsByLparen map[token.Pos]*ast.CallExpr
 	// contextIface is nil when context.Context is not reachable from the import
 	// graph. Only suggested fixes need it; the analysis itself does not.
@@ -35,7 +35,7 @@ type lineIndex struct {
 func newSourceIndex(pass *analysis.Pass, contextIface *types.Interface) (*sourceIndex, error) {
 	i := &sourceIndex{
 		pass: pass, files: make(map[*token.File]*ast.File, len(pass.Files)),
-		lines:         make(map[*ast.File]*lineIndex, len(pass.Files)),
+		lines:         make(map[*token.File]*lineIndex, len(pass.Files)),
 		callsByLparen: make(map[token.Pos]*ast.CallExpr), contextIface: contextIface,
 	}
 	for _, f := range pass.Files {
@@ -66,26 +66,38 @@ func newSourceIndex(pass *analysis.Pass, contextIface *types.Interface) (*source
 				lines.comments[line] = append(lines.comments[line], comment)
 			}
 		}
-		i.lines[f] = lines
+		i.lines[tf] = lines
 	}
 	return i, nil
 }
 
-func (e *engine) report() {
+// report turns the findings into diagnostics. The source index is built only
+// once a finding needs it, so a package whose every output is proven pays for
+// the dataflow alone.
+func (e *engine) report(contextIface *types.Interface) error {
+	var sources *sourceIndex
 	for _, fn := range e.srcFuncs {
 		for _, finding := range e.findings[fn] {
-			call := e.sources.callAt(finding.pos)
-			if finding.state == stateHasContext || e.sources.hasNoLint(call) {
+			if finding.state == stateHasContext {
 				continue
 			}
-			nilCtx := finding.nilCtx
+			if sources == nil {
+				var err error
+				if sources, err = newSourceIndex(e.pass, contextIface); err != nil {
+					return err
+				}
+			}
+			call := sources.callAt(finding.pos)
+			if sources.hasNoLint(call) {
+				continue
+			}
 			message := "zerolog output is not proven to carry context before " + finding.spec.name + "()"
-			if nilCtx {
+			if finding.nilCtx {
 				message = "zerolog output's final Ctx() argument is nil before " + finding.spec.name + "()"
 			}
 			diagnostic := analysis.Diagnostic{Pos: finding.pos, Message: message}
-			if selector := e.fixTarget(finding.spec, call); selector != nil && !nilCtx {
-				if ctx := e.sources.contextExpr(finding.pos); ctx != "" {
+			if selector := e.fixTarget(finding.spec, call); selector != nil && !finding.nilCtx {
+				if ctx := sources.contextExpr(finding.pos); ctx != "" {
 					diagnostic.SuggestedFixes = []analysis.SuggestedFix{{
 						Message: "Attach context before " + finding.spec.name + "()",
 						TextEdits: []analysis.TextEdit{{
@@ -97,6 +109,7 @@ func (e *engine) report() {
 			e.pass.Report(diagnostic)
 		}
 	}
+	return nil
 }
 
 // fixTarget returns the selector an inserted Ctx() call would precede, or nil
@@ -179,7 +192,7 @@ func (i *sourceIndex) candidateNamed(sc, scope *types.Scope, name string, pos to
 }
 
 func (i *sourceIndex) contextCandidate(variable *types.Var, name string, pos token.Pos) string {
-	t := unalias(variable.Type())
+	t := types.Unalias(variable.Type())
 	expression := ""
 	if types.Implements(t, i.contextIface) {
 		expression = name
@@ -210,11 +223,7 @@ func (i *sourceIndex) nilIndex() map[*types.Var]*nilFacts {
 	pass := i.pass
 	i.nils = make(map[*types.Var]*nilFacts)
 	declare := func(variable *types.Var, pos token.Pos, nil_ bool) {
-		facts := i.nils[variable]
-		if facts == nil {
-			facts = &nilFacts{}
-			i.nils[variable] = facts
-		}
+		facts := i.factsFor(variable)
 		facts.declaredNil, facts.declarationPos = nil_, pos
 	}
 	for _, file := range pass.Files {
@@ -260,12 +269,17 @@ func (i *sourceIndex) nilIndex() map[*types.Var]*nilFacts {
 }
 
 func (i *sourceIndex) recordAssignment(variable *types.Var, pos token.Pos) {
+	facts := i.factsFor(variable)
+	facts.assignments = append(facts.assignments, pos)
+}
+
+func (i *sourceIndex) factsFor(variable *types.Var) *nilFacts {
 	facts := i.nils[variable]
 	if facts == nil {
 		facts = &nilFacts{}
 		i.nils[variable] = facts
 	}
-	facts.assignments = append(facts.assignments, pos)
+	return facts
 }
 
 // definitelyNil deliberately answers only when nil is certain by source
@@ -305,15 +319,9 @@ func (i *sourceIndex) hasNoLint(call *ast.CallExpr) bool {
 	if call == nil {
 		return false
 	}
+	// call came from callsByLparen, so its file is one the index was built for.
 	tf := i.pass.Fset.File(call.Pos())
-	if tf == nil {
-		return false
-	}
-	f := i.files[tf]
-	if f == nil {
-		return false
-	}
-	lines := i.lines[f]
+	lines := i.lines[tf]
 	start, end := tf.Line(call.Pos()), tf.Line(call.End())
 	for line := start; line <= end; line++ {
 		for _, comment := range lines.comments[line] {

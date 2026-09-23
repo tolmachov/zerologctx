@@ -20,6 +20,7 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/ctrlflow"
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/types/typeutil"
 )
 
 // Analyzer is the zerologctx analyzer. See its Doc field for the user-facing
@@ -41,7 +42,8 @@ Ctx is order-sensitive: the last call wins, and a final Ctx(nil) has its own
 diagnostic. Anything the analyzer cannot follow - a value captured by a
 closure, one written into a slice, map, channel or global, a receiver field, an
 opaque call - stays unknown and is reported. A goroutine establishes nothing
-where it is spawned.
+where it is spawned. A sink in a goroutine or a deferred call is judged against
+every state from its statement through function exit.
 
 Suppress an individual sink with //nolint:zerologctx, either at the end of a
 line the call spans or on a line of its own directly above it. Bare //nolint
@@ -152,16 +154,14 @@ func run(pass *analysis.Pass) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	engine := newEngine(pass, srcFuncs)
+	engine.solveSummaries()
 	// contextIface may be nil: export data records only the imports a package's
 	// API needs, so context can be absent from the graph of a package that
 	// nonetheless logs. Only suggested fixes consult it.
-	sources, err := newSourceIndex(pass, contextIface)
-	if err != nil {
+	if err := engine.report(contextIface); err != nil {
 		return nil, err
 	}
-	engine := newEngine(pass, srcFuncs, sources)
-	engine.solveSummaries()
-	engine.report()
 	engine.exportSummaries()
 	return nil, nil
 }
@@ -224,19 +224,16 @@ func buildPackageSSA(pass *analysis.Pass) ([]*ssa.Function, error) {
 			}
 		}
 	}
+	// Package-level variable initializers, and every closure they contain, run
+	// in the synthetic package initializer, which no declaration names.
+	addWithAnons(ssaPackage.Func("init"))
 	return funcs, nil
 }
 
 func scanImports(pkg *types.Package) (bool, *types.Interface) {
-	seen := map[*types.Package]bool{}
 	var has bool
 	var contextIface *types.Interface
-	var visit func(*types.Package)
-	visit = func(p *types.Package) {
-		if p == nil || seen[p] {
-			return
-		}
-		seen[p] = true
+	for _, p := range typeutil.Dependencies(pkg) {
 		if p.Path() == zerologPkgPath || strings.HasPrefix(p.Path(), zerologPkgPath+"/") {
 			has = true
 		}
@@ -245,10 +242,6 @@ func scanImports(pkg *types.Package) (bool, *types.Interface) {
 				contextIface, _ = obj.Type().Underlying().(*types.Interface)
 			}
 		}
-		for _, imp := range p.Imports() {
-			visit(imp)
-		}
 	}
-	visit(pkg)
 	return has, contextIface
 }

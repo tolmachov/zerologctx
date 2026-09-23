@@ -53,26 +53,6 @@ func TestSuggestedFixesCompile(t *testing.T) {
 	}
 }
 
-func TestJoinState(t *testing.T) {
-	tests := []struct {
-		name string
-		a, b ctxState
-		want ctxState
-	}{
-		{"bottom", stateUnreachable, stateHasContext, stateHasContext},
-		{"same", stateNoContext, stateNoContext, stateNoContext},
-		{"conflict", stateHasContext, stateNoContext, stateUnknown},
-		{"unknown", stateHasContext, stateUnknown, stateUnknown},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := joinState(test.a, test.b); got != test.want {
-				t.Fatalf("joinState(%s, %s) = %s, want %s", test.a, test.b, got, test.want)
-			}
-		})
-	}
-}
-
 func TestJoinFrameTreatsMissingMemoryAsUnknown(t *testing.T) {
 	location := memoryLocation{root: &ssa.Alloc{}}
 	safe := newFrame()
@@ -123,6 +103,9 @@ func TestSummaryFromFactClampsStatesOutsideTheLattice(t *testing.T) {
 }
 
 func TestJoinStateIsALattice(t *testing.T) {
+	if got := joinState(stateHasContext, stateNoContext); got != stateUnknown {
+		t.Errorf("joinState(has-context, no-context) = %s, want unknown: the two proofs are incomparable", got)
+	}
 	states := []ctxState{stateUnreachable, stateHasContext, stateNoContext, stateUnknown}
 	for _, a := range states {
 		if got := joinState(a, a); got != a {
@@ -157,12 +140,21 @@ func TestJoinValueWidensInsteadOfCollapsing(t *testing.T) {
 		locs: map[eventLocation]struct{}{{value: &ssa.Alloc{}}: {}},
 	}
 	aggregate := abstractValue{elems: []abstractValue{logger, event}}
+	stored := abstractValue{
+		kind: kindLogger, state: stateNoContext,
+		memLocs: map[memoryLocation]struct{}{{root: &ssa.Alloc{}}: {}},
+	}
 	values := []abstractValue{
-		{}, topValue, logger, event, nilEvent, located, aggregate,
-		{kind: kindBuilder, state: stateUnknown},
+		{}, topValue, logger, event, nilEvent, located, aggregate, stored,
+		{kind: kindBuilder, state: stateUnknown}, unknownValue(kindEvent),
+		{kind: kindEvent, state: stateNoContext}, {kind: kindEvent, state: stateUnknown},
+		{elems: []abstractValue{topValue, event}},
 	}
 	for _, a := range values {
 		for _, b := range values {
+			if got, want := covers(a, b), equalValue(joinValue(a, b), a); got != want {
+				t.Errorf("covers(%v, %v) = %t, but joining changes a: %t", a, b, got, !want)
+			}
 			if !equalValue(joinValue(a, b), joinValue(b, a)) {
 				t.Errorf("joinValue(%v, %v) is not commutative", a, b)
 			}

@@ -39,9 +39,16 @@ First public release. Nothing has shipped before it, so everything below is new.
   addresses, stores into slices, maps, channels and globals, aggregates passed
   by value, mutable globals, receiver fields and opaque calls all stay unknown
   and are reported.
-- Goroutines establish nothing where they are spawned, and a sink a goroutine
-  carries is judged against the state at function exit, so a later mutation
-  cannot be missed.
+- Goroutines establish nothing where they are spawned. A sink a goroutine or a
+  deferred call carries is judged against every state from its statement
+  through function exit, with the function's other deferred calls applied:
+  the goroutine may run at any of them, and the deferred call runs on a panic
+  at any of them, so a context attached later proves nothing.
+- A local struct escaping behind an interface or through a channel takes the
+  zerolog values it holds with it; a call through a zerolog interface runs
+  user code and is opaque.
+- Package-level variable initializers, including the closures they call, are
+  analysed like any function.
 - Postconditions are applied only to a location proven to be the one the call
   touched; a may-alias set is widened instead.
 
