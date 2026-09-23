@@ -30,8 +30,9 @@ jobs:
       - name: Verify modules
         run: |
           go mod download
+          go mod tidy -diff
           go mod verify
-          (cd testdata && go mod download && go mod verify)
+          (cd testdata && go mod download && go mod tidy -diff && go mod verify)
 
       - name: Build
         run: go build ./...

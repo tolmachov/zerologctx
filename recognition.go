@@ -23,16 +23,9 @@ type sinkSpec struct {
 var eventSinks = map[string]bool{"Msg": true, "Msgf": true, "MsgFunc": true, "Send": true}
 var loggerSinks = map[string]bool{"Print": true, "Printf": true, "Println": true, "Write": true}
 
-func unalias(t types.Type) types.Type {
-	if t == nil {
-		return nil
-	}
-	return types.Unalias(t)
-}
-
 func deref(t types.Type) types.Type {
 	for {
-		t = unalias(t)
+		t = types.Unalias(t)
 		p, ok := t.(*types.Pointer)
 		if !ok {
 			return t
@@ -68,11 +61,10 @@ func receiverType(fn *types.Func) types.Type {
 	if fn == nil {
 		return nil
 	}
-	sig, _ := unalias(fn.Type()).(*types.Signature)
-	if sig == nil || sig.Recv() == nil {
-		return nil
+	if recv := fn.Signature().Recv(); recv != nil {
+		return recv.Type()
 	}
-	return sig.Recv().Type()
+	return nil
 }
 
 // sinkForKind is the one table lookup deciding whether a method call on a

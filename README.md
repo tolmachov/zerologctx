@@ -50,8 +50,10 @@ A value a closure captures is followed *into* the closure through parameters
 and return values, but a captured variable the closure may rewrite is not: the
 capture invalidates it, and every later use is reported. A method value is
 exact while it stays put and invalidating once it escapes. A `go` statement
-establishes nothing where it is spawned, and a sink a goroutine carries is
-judged against the state at function exit.
+establishes nothing where it is spawned. A sink a goroutine or a deferred call
+carries is judged against every state from its statement through function
+exit, with the function's other deferred calls applied: the goroutine may run
+at any of them, and the deferred call runs on a panic at any of them.
 
 Writing a zerolog value into memory the analyzer cannot name — a slice, a map,
 a channel, a global, a struct passed by value — is an escape, and the value is

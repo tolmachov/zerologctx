@@ -1,6 +1,7 @@
 package zerologctx
 
 import (
+	"go/types"
 	"os"
 	"testing"
 
@@ -42,10 +43,32 @@ func BenchmarkFrameJoin(b *testing.B) {
 }
 
 func BenchmarkSSAEngineLargeAliasCFG(b *testing.B) {
-	testdata := analysistest.TestData()
+	dataflow, fn := strictpkgFunction(b, "largeAliasCFG")
+	b.ReportAllocs()
+	for b.Loop() {
+		dataflow.solve(fn)
+	}
+}
+
+// BenchmarkLaterSinksLargeCFG measures the judgement of deferred and
+// concurrent sinks, which reads every state after their statement.
+func BenchmarkLaterSinksLargeCFG(b *testing.B) {
+	dataflow, fn := strictpkgFunction(b, "largeDeferCFG")
+	_, frames := dataflow.solve(fn)
+	b.ReportAllocs()
+	for b.Loop() {
+		dataflow.collectFindings(fn, frames)
+	}
+}
+
+// strictpkgFunction loads the strictpkg fixture and returns an engine over the
+// named function alone. The analyzer builds SSA without InstantiateGenerics,
+// so the benchmarks measure the SSA shape it actually sees.
+func strictpkgFunction(b *testing.B, name string) (*engine, *ssa.Function) {
+	b.Helper()
 	packagesUnderTest, err := packages.Load(&packages.Config{
 		Mode: packages.LoadAllSyntax,
-		Dir:  testdata,
+		Dir:  analysistest.TestData(),
 		Env:  append(os.Environ(), "GOWORK=off"),
 	}, "./strictpkg")
 	if err != nil {
@@ -57,26 +80,21 @@ func BenchmarkSSAEngineLargeAliasCFG(b *testing.B) {
 	for _, loadError := range packagesUnderTest[0].Errors {
 		b.Fatalf("load strictpkg: %v", loadError)
 	}
-
-	// The analyzer builds SSA without InstantiateGenerics, so the benchmark
-	// measures the SSA shape it actually sees.
 	program, ssaPackages := ssautil.AllPackages(packagesUnderTest, ssa.BuilderMode(0))
 	program.Build()
-	ssaPackage := ssaPackages[0]
-	fn, ok := ssaPackage.Members["largeAliasCFG"].(*ssa.Function)
+	fn, ok := ssaPackages[0].Members[name].(*ssa.Function)
 	if !ok {
-		b.Fatal("largeAliasCFG SSA function not found")
+		b.Fatalf("%s SSA function not found", name)
 	}
 	pass := &analysis.Pass{
 		Fset:      packagesUnderTest[0].Fset,
 		Files:     packagesUnderTest[0].Syntax,
 		Pkg:       packagesUnderTest[0].Types,
 		TypesInfo: packagesUnderTest[0].TypesInfo,
+		// No other package was analysed, so none has exported a fact.
+		ImportObjectFact: func(types.Object, analysis.Fact) bool { return false },
 	}
-	dataflow := newEngine(pass, []*ssa.Function{fn}, nil)
-
-	b.ReportAllocs()
-	for b.Loop() {
-		dataflow.solve(fn)
-	}
+	dataflow := newEngine(pass, []*ssa.Function{fn})
+	dataflow.solveSummaries()
+	return dataflow, fn
 }

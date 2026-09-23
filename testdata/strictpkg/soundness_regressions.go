@@ -48,7 +48,7 @@ func tupleResults(ctx context.Context) {
 
 func deferredSink(ctx context.Context) {
 	event := log.Info().Ctx(ctx)
-	defer event.Msg("observes the final event state") // want `zerolog output's final Ctx\(\) argument is nil before Msg\(\)`
+	defer event.Msg("may run before or after the context is cleared") // want `zerolog output is not proven to carry context before Msg\(\)`
 	event.Ctx(nil)
 }
 
@@ -266,4 +266,193 @@ func nolintInteriorChainLine() {
 	log.Info().
 		Str("key", "value"). //nolint:zerologctx
 		Msg("suppressed from an interior chain line")
+}
+
+// A self-recursive function reads its own summary, so its first round is not
+// final: the recursive call reads a summary still at the bottom, and only a
+// second round joins in the no-context return. helperAfterSelf is a later
+// local call, which must not erase that the function calls itself.
+func selfRecursiveSecondRound(ctx context.Context, depth int) zerolog.Logger {
+	var logger zerolog.Logger
+	if depth > 0 {
+		logger = selfRecursiveSecondRound(ctx, depth-1)
+		helperAfterSelf()
+	} else {
+		logger = zerolog.New(io.Discard).With().Ctx(ctx).Logger()
+	}
+	logger.Info().Msg("own result is joined with a no-context return") // want `zerolog output is not proven to carry context before Msg\(\)`
+	return zerolog.New(io.Discard)
+}
+
+func helperAfterSelf() {}
+
+var dropHookContext bool
+
+// A function that passes itself as a hook reads its own summary through a
+// function value rather than a call. The second branch puts the sink in a
+// block of its own, where a stale first-round state would still be visible.
+func selfHook(event *zerolog.Event) {
+	if dropHookContext {
+		event.Ctx(nil)
+		return
+	}
+	event.Ctx(context.Background()).Func(selfHook)
+	if dropHookContext {
+		println()
+	}
+	event.Msg("own effect may drop the context") // want `zerolog output is not proven to carry context before Msg\(\)`
+}
+
+func useSelfHook(ctx context.Context) {
+	log.Info().Ctx(ctx).Func(selfHook).Msg("hook may drop the context") // want `zerolog output is not proven to carry context before Msg\(\)`
+}
+
+func inspectOnly(event *zerolog.Event) bool { return event.Enabled() }
+
+// A helper that never writes its parameter preserves what the caller proved.
+func untouchedParameterKeepsProof(ctx context.Context) {
+	event := log.Info().Ctx(ctx)
+	inspectOnly(event)
+	event.Msg("helper never writes the event")
+}
+
+// A function without an explicit exit still runs its goroutines, and its
+// defers on a runtime panic: both are judged against every state after their
+// statement, and a context proven there and never cleared holds throughout.
+func goroutineSinkInEndlessLoop(ctx context.Context, work func()) {
+	defer log.Info().Msg("runs if work panics") // want `zerolog output is not proven to carry context before Msg\(\)`
+	event := log.Info().Ctx(ctx)
+	go event.Msg("proven at every later state")
+	for {
+		work()
+		log.Info().Ctx(ctx).Msg("proven")
+	}
+}
+
+func unprovenSinkInEndlessLoop() {
+	for {
+		log.Info().Msg("inside endless loop") // want `zerolog output is not proven to carry context before Msg\(\)`
+	}
+}
+
+type messenger interface{ Msg(msg string) }
+
+// Whether a deferred or concurrent call is a sink is decided at its statement,
+// where the receiver behind the interface is known, not at the exit.
+func goroutineInterfaceSinkInEndlessLoop() {
+	var output messenger = log.Info()
+	go output.Msg("dispatched through an interface") // want `zerolog output is not proven to carry context before Msg\(\)`
+	for {
+	}
+}
+
+func goroutineInterfaceSinkOffTheExitPath(cond bool) {
+	if cond {
+		var output messenger = log.Info()
+		go output.Msg("receiver absent from the exit state") // want `zerolog output is not proven to carry context before Msg\(\)`
+		for {
+		}
+	}
+	panic("exit without the receiver")
+}
+
+type contextDropper interface{ Drop() }
+
+type heldEvent struct{ event *zerolog.Event }
+
+func (h *heldEvent) Drop() { h.event.Ctx(nil) }
+
+// A local struct that escapes behind an interface takes everything it holds
+// with it.
+func interfaceHidesHeldEvent(ctx context.Context) {
+	event := log.Info().Ctx(ctx)
+	var dropper contextDropper = &heldEvent{event: event}
+	dropper.Drop()
+	event.Msg("dropped through the interface") // want `zerolog output is not proven to carry context before Msg\(\)`
+}
+
+func channelHidesHeldEvent(ctx context.Context, ch chan any) {
+	event := log.Info().Ctx(ctx)
+	ch <- any(&heldEvent{event: event})
+	event.Msg("sent behind an interface") // want `zerolog output is not proven to carry context before Msg\(\)`
+}
+
+// A goroutine may run at any moment after its statement, so a context attached
+// later proves nothing about what it logs.
+func goroutineSeesStateBeforeLaterCtx(ctx context.Context, logger zerolog.Logger) {
+	event := logger.Info()
+	go event.Msg("may run before Ctx") // want `zerolog output is not proven to carry context before Msg\(\)`
+	event.Ctx(ctx)
+}
+
+// A deferred call runs on a panic anywhere after its statement, not only at
+// the explicit exits.
+func deferRunsOnPanicBeforeCtx(ctx context.Context, work func()) {
+	event := log.Info()
+	defer event.Msg("runs if work panics") // want `zerolog output is not proven to carry context before Msg\(\)`
+	work()
+	event.Ctx(ctx)
+}
+
+var initializedByClosure = func() int {
+	log.Info().Msg("package initializer") // want `zerolog output is not proven to carry context before Msg\(\)`
+	return 0
+}()
+
+func init() {
+	log.Info().Msg("declared init") // want `zerolog output is not proven to carry context before Msg\(\)`
+}
+
+// A nil context attached before the statement holds at every later state.
+func deferredNilCtxHoldsThroughout(work func()) {
+	defer log.Info().Ctx(nil).Msg("nil at every later state") // want `zerolog output's final Ctx\(\) argument is nil before Msg\(\)`
+	work()
+}
+
+// A goroutine spawned in a loop may still be waiting when the next iteration
+// clears the context, before this one's statement is reached again.
+func goroutineSeesNextIteration(ctx context.Context, n int) {
+	event := log.Info().Ctx(ctx)
+	for range n {
+		event.Ctx(nil)
+		event.Ctx(ctx)
+		go event.Msg("the next iteration clears the context first") // want `zerolog output is not proven to carry context before Msg\(\)`
+	}
+}
+
+// Deferred calls run last in, first out, so one registered after a deferred
+// sink runs before it, on every exit and every panic.
+func deferredSinkAfterDeferredClear(ctx context.Context) {
+	event := log.Info().Ctx(ctx)
+	defer event.Msg("the later defer runs first") // want `zerolog output is not proven to carry context before Msg\(\)`
+	defer event.Ctx(nil)
+}
+
+type dropOnMarshal struct{}
+
+func (dropOnMarshal) MarshalZerologObject(event *zerolog.Event) { event.Ctx(nil) } // want MarshalZerologObject:"zerolog context summary results=\\[\\] effects=\\[preserved no-context\\]"
+
+// A zerolog interface dispatches to whatever implements it, which is not
+// zerolog's own code.
+func zerologInterfaceRunsUserCode(ctx context.Context, marshaler zerolog.LogObjectMarshaler) {
+	event := log.Info().Ctx(ctx)
+	marshaler.MarshalZerologObject(event)
+	event.Msg("user code behind a zerolog interface") // want `zerolog output is not proven to carry context before Msg\(\)`
+}
+
+// A deferred call registered after a deferred sink runs before it on a panic
+// too, not only at the explicit exits this function does not have.
+func deferredClearOnPanicInEndlessLoop(ctx context.Context, work func()) {
+	event := log.Info().Ctx(ctx)
+	defer event.Msg("the later defer runs first on a panic") // want `zerolog output is not proven to carry context before Msg\(\)`
+	defer event.Ctx(nil)
+	for {
+		work()
+	}
+}
+
+// A package-level log sink takes no zerolog value, so a function holding only
+// that is analysed all the same.
+func packageLevelSinkOnly(message string) {
+	log.Print(message) // want `zerolog output is not proven to carry context before Print\(\)`
 }

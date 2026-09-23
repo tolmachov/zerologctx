@@ -3,6 +3,7 @@ package zerologctx
 import (
 	"go/token"
 	"go/types"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,7 +14,7 @@ import (
 
 // abstractValue is what is known about one SSA value.
 //
-// Three invariants are not expressible in the type and must be respected by
+// Four invariants are not expressible in the type and must be respected by
 // every reader:
 //
 //   - state alone is meaningless for an event that carries locs. A zerolog
@@ -69,11 +70,14 @@ func unknownValue(kind valueKind) abstractValue {
 // joining incomparable values widens instead of collapsing to "unreachable".
 var topValue = abstractValue{state: stateUnknown, partialLocs: true}
 
-// identified marks a value whose location is exactly known, undoing the
-// partialLocs that unknownValue applies to a value with no identity.
-func (v abstractValue) identified() abstractValue {
-	v.partialLocs = false
-	return v
+// freshEvent creates the one event object a location denotes and seeds what
+// is known about it. The value is a complete singleton, so it is a must-alias
+// and may receive postconditions. Its own state stays at the bottom: an event
+// with locs keeps its context in frame.events. Seeding is not a write, so no
+// parameter write is recorded.
+func freshEvent(current *frame, location eventLocation, state eventState) abstractValue {
+	current.events[location] = state
+	return abstractValue{kind: kindEvent, locs: map[eventLocation]struct{}{location: {}}}
 }
 
 func joinValue(a, b abstractValue) abstractValue {
@@ -87,24 +91,16 @@ func joinValue(a, b abstractValue) abstractValue {
 		return topValue
 	}
 	r := abstractValue{kind: a.kind, state: joinState(a.state, b.state), partialLocs: a.partialLocs || b.partialLocs}
-	r.nilCtx = r.state == stateNoContext && a.state == stateNoContext && b.state == stateNoContext && a.nilCtx && b.nilCtx
+	r.nilCtx = joinNilCtx(a, b, r.state)
 	if len(a.locs)+len(b.locs) != 0 {
 		r.locs = make(map[eventLocation]struct{}, len(a.locs)+len(b.locs))
-		for loc := range a.locs {
-			r.locs[loc] = struct{}{}
-		}
-		for loc := range b.locs {
-			r.locs[loc] = struct{}{}
-		}
+		maps.Copy(r.locs, a.locs)
+		maps.Copy(r.locs, b.locs)
 	}
 	if len(a.memLocs)+len(b.memLocs) != 0 {
 		r.memLocs = make(map[memoryLocation]struct{}, len(a.memLocs)+len(b.memLocs))
-		for loc := range a.memLocs {
-			r.memLocs[loc] = struct{}{}
-		}
-		for loc := range b.memLocs {
-			r.memLocs[loc] = struct{}{}
-		}
+		maps.Copy(r.memLocs, a.memLocs)
+		maps.Copy(r.memLocs, b.memLocs)
 	}
 	if len(a.elems) == len(b.elems) && len(a.elems) > 0 {
 		r.elems = make([]abstractValue, len(a.elems))
@@ -113,6 +109,43 @@ func joinValue(a, b abstractValue) abstractValue {
 		}
 	}
 	return r
+}
+
+// joinNilCtx is the must-fact half of joinValue: a nil final Ctx survives only
+// when both sides are proven no-context with a nil argument.
+func joinNilCtx(a, b abstractValue, joined ctxState) bool {
+	return joined == stateNoContext && a.state == stateNoContext && b.state == stateNoContext && a.nilCtx && b.nilCtx
+}
+
+// covers reports whether joining b into a leaves a unchanged, without building
+// the join. Once the worklist settles almost every join is such a no-op, and
+// joinValue allocates fresh location sets before equalValue can tell.
+func covers(a, b abstractValue) bool {
+	if b.isZero() {
+		return true
+	}
+	if a.isZero() {
+		return false
+	}
+	if a.kind != b.kind {
+		return equalValue(a, topValue)
+	}
+	state := joinState(a.state, b.state)
+	if state != a.state || (b.partialLocs && !a.partialLocs) || joinNilCtx(a, b, state) != a.nilCtx {
+		return false
+	}
+	for loc := range b.locs {
+		if _, ok := a.locs[loc]; !ok {
+			return false
+		}
+	}
+	for loc := range b.memLocs {
+		if _, ok := a.memLocs[loc]; !ok {
+			return false
+		}
+	}
+	// joinValue keeps elements only when both sides have the same number.
+	return len(a.elems) == 0 || slices.EqualFunc(a.elems, b.elems, covers)
 }
 
 func unknownLike(value abstractValue) abstractValue {
@@ -127,25 +160,8 @@ func unknownLike(value abstractValue) abstractValue {
 }
 
 func equalValue(a, b abstractValue) bool {
-	if a.kind != b.kind || a.state != b.state || a.nilCtx != b.nilCtx || a.partialLocs != b.partialLocs || len(a.locs) != len(b.locs) || len(a.memLocs) != len(b.memLocs) || len(a.elems) != len(b.elems) {
-		return false
-	}
-	for loc := range a.memLocs {
-		if _, ok := b.memLocs[loc]; !ok {
-			return false
-		}
-	}
-	for loc := range a.locs {
-		if _, ok := b.locs[loc]; !ok {
-			return false
-		}
-	}
-	for idx := range a.elems {
-		if !equalValue(a.elems[idx], b.elems[idx]) {
-			return false
-		}
-	}
-	return true
+	return a.kind == b.kind && a.state == b.state && a.nilCtx == b.nilCtx && a.partialLocs == b.partialLocs &&
+		maps.Equal(a.locs, b.locs) && maps.Equal(a.memLocs, b.memLocs) && slices.EqualFunc(a.elems, b.elems, equalValue)
 }
 
 // eventState is what is known about one zerolog Event object. state is a
@@ -182,10 +198,16 @@ func newFrame() *frame {
 	}
 }
 
+// clone copies each map whole rather than re-inserting entry by entry. Values
+// are copied shallowly: their locs and memLocs are shared, which is why
+// abstractValue forbids mutating them.
 func (f *frame) clone() *frame {
-	r := newFrame()
-	r.resetFrom(f)
-	return r
+	return &frame{
+		values: maps.Clone(f.values),
+		memory: maps.Clone(f.memory),
+		events: maps.Clone(f.events),
+		writes: maps.Clone(f.writes),
+	}
 }
 
 // resetFrom refills the frame from src, reusing the maps it already allocated.
@@ -197,45 +219,34 @@ func (f *frame) resetFrom(src *frame) {
 	clear(f.memory)
 	clear(f.events)
 	clear(f.writes)
-	for k, v := range src.values {
-		f.values[k] = v
-	}
-	for k, v := range src.memory {
-		f.memory[k] = v
-	}
-	for k, v := range src.events {
-		f.events[k] = v
-	}
-	for k, v := range src.writes {
-		f.writes[k] = v
-	}
+	maps.Copy(f.values, src.values)
+	maps.Copy(f.memory, src.memory)
+	maps.Copy(f.events, src.events)
+	maps.Copy(f.writes, src.writes)
 }
 
 func joinFrame(dst, src *frame) bool {
 	changed := false
+	// covers is exact, so a join it does not cover always changes the value.
 	for k, v := range src.values {
-		n := joinValue(dst.values[k], v)
-		if !equalValue(dst.values[k], n) {
-			dst.values[k], changed = n, true
+		if current := dst.values[k]; !covers(current, v) {
+			dst.values[k], changed = joinValue(current, v), true
 		}
 	}
 	for k, v := range src.memory {
 		current, ok := dst.memory[k]
 		if !ok {
-			current = unknownLike(v)
-		}
-		n := joinValue(current, v)
-		if !ok || !equalValue(dst.memory[k], n) {
-			dst.memory[k], changed = n, true
+			dst.memory[k], changed = joinValue(unknownLike(v), v), true
+		} else if !covers(current, v) {
+			dst.memory[k], changed = joinValue(current, v), true
 		}
 	}
 	for k, current := range dst.memory {
 		if _, ok := src.memory[k]; ok {
 			continue
 		}
-		n := joinValue(current, unknownLike(current))
-		if !equalValue(current, n) {
-			dst.memory[k], changed = n, true
+		if unknown := unknownLike(current); !covers(current, unknown) {
+			dst.memory[k], changed = joinValue(current, unknown), true
 		}
 	}
 	for k, v := range src.events {
@@ -263,30 +274,8 @@ func joinFrame(dst, src *frame) bool {
 }
 
 func framesEqual(a, b *frame) bool {
-	if len(a.values) != len(b.values) || len(a.memory) != len(b.memory) || len(a.events) != len(b.events) || len(a.writes) != len(b.writes) {
-		return false
-	}
-	for k, v := range a.values {
-		if !equalValue(v, b.values[k]) {
-			return false
-		}
-	}
-	for k, v := range a.memory {
-		if !equalValue(v, b.memory[k]) {
-			return false
-		}
-	}
-	for k, v := range a.events {
-		if b.events[k] != v {
-			return false
-		}
-	}
-	for k, v := range a.writes {
-		if b.writes[k] != v {
-			return false
-		}
-	}
-	return true
+	return maps.EqualFunc(a.values, b.values, equalValue) && maps.EqualFunc(a.memory, b.memory, equalValue) &&
+		maps.Equal(a.events, b.events) && maps.Equal(a.writes, b.writes)
 }
 
 type functionSummary struct {
@@ -310,31 +299,49 @@ type sinkFinding struct {
 
 // collector accumulates the findings of one function. A nil *collector puts
 // the transfer functions in summary-only mode, which makes "collecting" and
-// "having somewhere to collect into" the same condition.
+// "having somewhere to collect into" the same condition. Every call reaches it
+// at most once: each reachable block is replayed once, and deferred and
+// concurrent calls are judged once, after the straight-line flow.
 type collector struct {
 	findings []sinkFinding
-	seen     map[*ssa.CallCommon]bool
+}
+
+// observe is what current proves about the context of an output with this
+// receiver, and whether its final Ctx argument was nil. A nil receiver means
+// nothing can be proven.
+func (e *engine) observe(receiver ssa.Value, current *frame) (ctxState, bool) {
+	if receiver == nil {
+		return stateUnknown, false
+	}
+	value := e.value(current, receiver)
+	return value.effectiveState(current), value.finalCtxWasNil(current)
 }
 
 type engine struct {
 	pass     *analysis.Pass
 	srcFuncs []*ssa.Function
-	sources  *sourceIndex
 	// findings are collected as each component settles, when its callees'
-	// summaries are already final, so no function is solved twice.
+	// summaries are already final, so collecting never re-solves a function.
 	findings map[*ssa.Function][]sinkFinding
 	later    map[*ssa.Function][]ssa.CallInstruction
 	// local holds the summary of every source function in this package. It is
 	// the single store; the *types.Func view exists only inside
 	// exportSummaries, where the analysis framework requires it.
 	local map[*ssa.Function]functionSummary
+	// imported caches the fact of every function object looked up, nil when it
+	// has none. Facts are final, so one import per object is enough.
+	imported map[*types.Func]*functionSummary
+	// addresses holds the one location set of every local address read so far.
+	// Location sets are never mutated, so one per location can be shared.
+	addresses map[memoryLocation]map[memoryLocation]struct{}
 }
 
-func newEngine(pass *analysis.Pass, srcFuncs []*ssa.Function, sources *sourceIndex) *engine {
+func newEngine(pass *analysis.Pass, srcFuncs []*ssa.Function) *engine {
 	return &engine{
-		pass: pass, srcFuncs: srcFuncs, sources: sources,
+		pass: pass, srcFuncs: srcFuncs,
 		findings: make(map[*ssa.Function][]sinkFinding), later: make(map[*ssa.Function][]ssa.CallInstruction),
-		local: make(map[*ssa.Function]functionSummary),
+		local: make(map[*ssa.Function]functionSummary), imported: make(map[*types.Func]*functionSummary),
+		addresses: make(map[memoryLocation]map[memoryLocation]struct{}),
 	}
 }
 
@@ -342,12 +349,48 @@ func (e *engine) solveSummaries() {
 	for _, fn := range e.srcFuncs {
 		e.local[fn] = emptySummary(fn)
 	}
-	for _, component := range summarySCCs(e.srcFuncs) {
-		frames := e.solveComponent(component)
+	components, selfCalls := summarySCCs(e.srcFuncs)
+	for _, component := range components {
+		recursive := len(component) > 1 || selfCalls[component[0]]
+		if !recursive && !touchesZerolog(component[0]) {
+			// Solving it would return the empty summary it already has and
+			// find nothing, so it is not solved.
+			continue
+		}
+		frames := e.solveComponent(component, recursive)
 		for _, fn := range component {
 			e.findings[fn] = e.collectFindings(fn, frames[fn])
 		}
 	}
+}
+
+// touchesZerolog reports whether fn has a body whose instructions use a zerolog
+// value, or call into zerolog's log package, whose sinks take no zerolog value.
+// A value that nothing uses can matter to no sink and no caller. A function
+// that does neither can prove nothing, change nothing a caller tracks, and hold
+// no sink.
+func touchesZerolog(fn *ssa.Function) bool {
+	if len(fn.Blocks) == 0 {
+		return true
+	}
+	var operands []*ssa.Value
+	for _, block := range fn.Blocks {
+		for _, instruction := range block.Instrs {
+			if call, ok := instruction.(ssa.CallInstruction); ok {
+				if callee := call.Common().StaticCallee(); callee != nil {
+					if object, _ := callee.Object().(*types.Func); isPackageLevelLogSink(object) {
+						return true
+					}
+				}
+			}
+			for _, operand := range instruction.Operands(operands[:0]) {
+				if *operand != nil && kindOf((*operand).Type()) != kindOther {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // blockFrames are the per-block dataflow states of one solved function.
@@ -358,7 +401,8 @@ type blockFrames struct {
 
 // solveComponent iterates the component to a fixed point and returns the
 // frames of the settling pass. Those frames are final: every callee outside the
-// component was solved first, and nothing inside it changed on the last pass.
+// component was solved first, and on the last pass either nothing inside it
+// changed or nothing inside it reads what did.
 //
 // Termination does not depend on the transfer functions being monotone; it
 // depends on the accumulator being. Each round joins its result into what is
@@ -366,7 +410,10 @@ type blockFrames struct {
 // proof, then the top) and the loop is bounded by the lattice, not by a cap.
 // Joining is also the honest answer when two rounds disagree: the top means
 // nothing is proven, which reports.
-func (e *engine) solveComponent(component []*ssa.Function) map[*ssa.Function]blockFrames {
+//
+// A component that is not recursive never reads its own summaries, so a
+// second round would recompute the first exactly; its first round is final.
+func (e *engine) solveComponent(component []*ssa.Function, recursive bool) map[*ssa.Function]blockFrames {
 	frames := make(map[*ssa.Function]blockFrames, len(component))
 	for {
 		changed := false
@@ -378,7 +425,7 @@ func (e *engine) solveComponent(component []*ssa.Function) map[*ssa.Function]blo
 				e.local[fn], changed = merged, true
 			}
 		}
-		if !changed {
+		if !changed || !recursive {
 			return frames
 		}
 	}
@@ -417,15 +464,25 @@ func emptySummary(fn *ssa.Function) functionSummary {
 
 // summarySCCs returns callees before callers and recursive groups as a single
 // component. Each group can therefore be solved to a local fixpoint without
-// repeatedly re-analyzing unrelated functions.
-func summarySCCs(functions []*ssa.Function) [][]*ssa.Function {
+// repeatedly re-analyzing unrelated functions. selfCalls marks the functions
+// that reach their own summary directly, the one way a singleton component is
+// recursive.
+func summarySCCs(functions []*ssa.Function) ([][]*ssa.Function, map[*ssa.Function]bool) {
 	local := make(map[*ssa.Function]bool, len(functions))
 	for _, fn := range functions {
 		local[fn] = true
 	}
 	edges := make(map[*ssa.Function][]*ssa.Function, len(functions))
+	selfCalls := make(map[*ssa.Function]bool)
 	for _, fn := range functions {
 		seen := make(map[*ssa.Function]bool)
+		addEdge := func(target *ssa.Function) {
+			if target != nil && local[target] && !seen[target] {
+				edges[fn] = append(edges[fn], target)
+				seen[target] = true
+				selfCalls[fn] = selfCalls[fn] || target == fn
+			}
+		}
 		for _, block := range fn.Blocks {
 			for _, instruction := range block.Instrs {
 				call, ok := instruction.(ssa.CallInstruction)
@@ -433,20 +490,9 @@ func summarySCCs(functions []*ssa.Function) [][]*ssa.Function {
 					continue
 				}
 				common := call.Common()
-				target := common.StaticCallee()
-				if closure, ok := common.Value.(*ssa.MakeClosure); ok {
-					target, _ = closure.Fn.(*ssa.Function)
-				}
-				if target != nil && local[target] && !seen[target] {
-					edges[fn] = append(edges[fn], target)
-					seen[target] = true
-				}
+				addEdge(common.StaticCallee())
 				for _, arg := range common.Args {
-					target = functionValue(arg)
-					if target != nil && local[target] && !seen[target] {
-						edges[fn] = append(edges[fn], target)
-						seen[target] = true
-					}
+					addEdge(functionValue(arg))
 				}
 			}
 		}
@@ -491,7 +537,7 @@ func summarySCCs(functions []*ssa.Function) [][]*ssa.Function {
 			visit(fn)
 		}
 	}
-	return components
+	return components, selfCalls
 }
 
 func functionValue(value ssa.Value) *ssa.Function {
@@ -581,22 +627,54 @@ func (e *engine) value(f *frame, value ssa.Value) abstractValue {
 	if got, ok := f.values[value]; ok {
 		return got
 	}
+	if location, ok := untrackedAddress(value); ok {
+		result := topValue
+		result.memLocs = e.addressSet(location)
+		return result
+	}
 	if location, ok := localLocation(value); ok && trackedPointerKind(value.Type()) != kindOther {
 		result, exists := f.memory[location]
 		if !exists {
 			result = unknownValue(kindOf(value.Type()))
 		}
-		result.memLocs = map[memoryLocation]struct{}{location: {}}
+		result.memLocs = e.addressSet(location)
 		return result
 	}
 	return unknownValue(kindOf(value.Type()))
 }
 
+// untrackedAddress returns the local location an address of any type but a
+// tracked zerolog pointer denotes, looking through the interfaces it may be
+// wrapped in. Such an address still reaches whatever is stored under it, so
+// its value carries that location wherever it flows. The value depends on the
+// syntax alone, so remember never stores it.
+func untrackedAddress(value ssa.Value) (memoryLocation, bool) {
+	switch wrapped := value.(type) {
+	case *ssa.MakeInterface:
+		value = wrapped.X
+	case *ssa.ChangeInterface:
+		return untrackedAddress(wrapped.X)
+	}
+	location, ok := localLocation(value)
+	if !ok || trackedPointerKind(value.Type()) != kindOther {
+		return memoryLocation{}, false
+	}
+	return location, true
+}
+
+func (e *engine) addressSet(location memoryLocation) map[memoryLocation]struct{} {
+	set, ok := e.addresses[location]
+	if !ok {
+		set = map[memoryLocation]struct{}{location: {}}
+		e.addresses[location] = set
+	}
+	return set
+}
+
 // solve runs the intraprocedural worklist to a fixed point and derives the
 // function's postconditions from the frames it produced.
 func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
-	resultCount := fn.Signature.Results().Len()
-	summary := functionSummary{results: make([]ctxState, resultCount), effects: make([]ctxState, len(fn.Params))}
+	summary := emptySummary(fn)
 	if len(fn.Blocks) == 0 {
 		// An assembly or //go:linkname declaration has no body to read, so
 		// nothing about it is proven.
@@ -613,11 +691,7 @@ func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
 		}
 		value := unknownValue(kind)
 		if kind == kindEvent {
-			location := eventLocation{value: param}
-			value.locs = map[eventLocation]struct{}{location: {}}
-			value = value.identified()
-			value.state = stateUnreachable
-			entry.events[location] = eventState{state: stateUnknown}
+			value = freshEvent(entry, eventLocation{value: param}, eventState{state: stateUnknown})
 		}
 		if trackedPointerKind(param.Type()) == kindOther {
 			entry.values[param] = value
@@ -665,25 +739,20 @@ func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
 	// Results and parameter effects are both read at the same moment — after
 	// the deferred and concurrent calls have taken effect — so each returning
 	// block's terminal frame is built once and both are derived from it.
-	effects := make([]ctxState, len(fn.Params))
+	results := fn.Signature.Results()
 	written := make([]bool, len(fn.Params))
 	for _, block := range fn.Blocks {
 		current := out[block]
-		if current == nil || !blockReturns(block) {
+		ret, returns := block.Instrs[len(block.Instrs)-1].(*ssa.Return)
+		if current == nil || !returns {
 			continue
 		}
 		terminal := e.withLaterEffects(fn, current)
-		for _, instruction := range block.Instrs {
-			ret, ok := instruction.(*ssa.Return)
-			if !ok {
+		for idx, value := range ret.Results {
+			if kindOf(results.At(idx).Type()) == kindOther {
 				continue
 			}
-			for idx, value := range ret.Results {
-				if idx >= resultCount || kindOf(fn.Signature.Results().At(idx).Type()) == kindOther {
-					continue
-				}
-				summary.results[idx] = joinState(summary.results[idx], e.value(terminal, value).latticeState(terminal))
-			}
+			summary.results[idx] = joinState(summary.results[idx], e.value(terminal, value).latticeState(terminal))
 		}
 		for idx, param := range fn.Params {
 			kind := trackedPointerKind(param.Type())
@@ -692,63 +761,141 @@ func (e *engine) solve(fn *ssa.Function) (functionSummary, blockFrames) {
 			}
 			written[idx] = written[idx] || terminal.writes[param]
 			if kind == kindEvent {
-				effects[idx] = joinState(effects[idx], terminal.events[eventLocation{value: param}].state)
+				summary.effects[idx] = joinState(summary.effects[idx], terminal.events[eventLocation{value: param}].state)
 			} else {
-				effects[idx] = joinState(effects[idx], terminal.memory[memoryLocation{root: param}].latticeState(terminal))
+				summary.effects[idx] = joinState(summary.effects[idx], terminal.memory[memoryLocation{root: param}].latticeState(terminal))
 			}
 		}
 	}
+	// A parameter no path wrote to is preserved, whatever it holds at exit.
 	for idx := range fn.Params {
-		if written[idx] {
-			summary.effects[idx] = effects[idx]
+		if !written[idx] {
+			summary.effects[idx] = stateUnreachable
 		}
 	}
 	return summary, blockFrames{in: in, out: out}
 }
 
 func (e *engine) collectFindings(fn *ssa.Function, frames blockFrames) []sinkFinding {
-	in, out := frames.in, frames.out
-	sink := &collector{findings: make([]sinkFinding, 0), seen: make(map[*ssa.CallCommon]bool)}
+	sink := &collector{}
+	var later []pendingSink
+	e.replay(fn, frames, sink, func(block *ssa.BasicBlock, index int, instruction ssa.Instruction, current *frame) {
+		switch instruction.(type) {
+		case *ssa.Defer, *ssa.Go:
+			common := instruction.(ssa.CallInstruction).Common()
+			if spec, receiver := e.sinkOf(common, current); spec.kind != sinkNone {
+				later = append(later, pendingSink{
+					sinkFinding: sinkFinding{pos: common.Pos(), state: stateUnreachable, spec: spec, nilCtx: true},
+					common:      common, receiver: receiver, block: block, index: index,
+				})
+			}
+		}
+	})
+	if len(later) != 0 {
+		e.observeLaterSinks(fn, frames, later)
+		for _, pending := range later {
+			sink.findings = append(sink.findings, pending.sinkFinding)
+		}
+	}
+	return sink.findings
+}
+
+// replay runs the transfer functions once more over every reachable block of
+// a solved function, from its settled entry state, and hands visit the state
+// after each instruction.
+func (e *engine) replay(fn *ssa.Function, frames blockFrames, sink *collector, visit func(block *ssa.BasicBlock, index int, instruction ssa.Instruction, current *frame)) {
 	scratch := newFrame()
 	for _, block := range fn.Blocks {
-		entry := in[block]
+		entry := frames.in[block]
 		if entry == nil {
 			continue
 		}
 		scratch.resetFrom(entry)
-		for _, instruction := range block.Instrs {
-			e.transfer(block, instruction, scratch, out, sink)
+		for index, instruction := range block.Instrs {
+			e.transfer(block, instruction, scratch, frames.out, sink)
+			visit(block, index, instruction, scratch)
 		}
 	}
+}
 
-	var exit *frame
-	for block, current := range out {
-		if !blockTerminates(block) {
+// pendingSink is a deferred or concurrent output operation, with its finding
+// joined over every state it may run against so far. It runs later, against
+// other states, but whether it is a sink is decided at its statement, where
+// its receiver is known: only its context is read from those states.
+type pendingSink struct {
+	sinkFinding
+	common   *ssa.CallCommon
+	receiver ssa.Value
+	block    *ssa.BasicBlock
+	index    int
+}
+
+// observeLaterSinks judges each deferred or concurrent sink against every state
+// from its statement onward. A goroutine may run at any of them, and a deferred
+// call runs at any of them too, because a runtime panic or Goexit can happen
+// anywhere, not only at an explicit exit. On every such path the function's
+// other deferred calls may run first, so their effects are applied to each
+// state before it is read — at the cost of a copy only where one of them
+// reaches anything.
+func (e *engine) observeLaterSinks(fn *ssa.Function, frames blockFrames, later []pendingSink) {
+	sinks := make(map[*ssa.CallCommon]bool, len(later))
+	after := make(map[*ssa.BasicBlock]map[*ssa.BasicBlock]bool)
+	for _, pending := range later {
+		sinks[pending.common] = true
+		if after[pending.block] == nil {
+			after[pending.block] = reachableFrom(pending.block.Succs)
+		}
+	}
+	effects := e.laterEffects(fn, func(common *ssa.CallCommon) bool { return sinks[common] })
+	var operands []ssa.Value
+	for _, common := range effects {
+		_, _, args, dispatched := resolvedCall(common)
+		if dispatched != nil {
+			operands = append(operands, dispatched)
+		}
+		operands = append(operands, args...)
+	}
+	observed := newFrame()
+	e.replay(fn, frames, nil, func(block *ssa.BasicBlock, index int, _ ssa.Instruction, current *frame) {
+		state := current
+		for idx := range later {
+			pending := &later[idx]
+			if !after[pending.block][block] && (block != pending.block || index < pending.index) {
+				continue
+			}
+			if state == current && slices.ContainsFunc(operands, func(operand ssa.Value) bool { return e.reaches(current, operand) }) {
+				observed.resetFrom(current)
+				e.invalidateCalls(observed, effects)
+				state = observed
+			}
+			observedState, nilCtx := e.observe(pending.receiver, state)
+			pending.state, pending.nilCtx = joinState(pending.state, observedState), pending.nilCtx && nilCtx
+		}
+	})
+}
+
+// reachableFrom returns every block reachable from the given ones, themselves
+// included.
+func reachableFrom(blocks []*ssa.BasicBlock) map[*ssa.BasicBlock]bool {
+	reached := make(map[*ssa.BasicBlock]bool)
+	stack := slices.Clone(blocks)
+	for len(stack) > 0 {
+		block := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if reached[block] {
 			continue
 		}
-		terminal := e.withLaterEffects(fn, current)
-		if exit == nil {
-			exit = terminal
-		} else {
-			joinFrame(exit, terminal)
-		}
+		reached[block] = true
+		stack = append(stack, block.Succs...)
 	}
-	if exit == nil {
-		return positioned(fn, sink.findings)
-	}
-	for _, later := range e.laterCalls(fn) {
-		if e.isSinkCall(later.Common(), exit) {
-			e.handleCall(nil, later.Common(), exit, sink)
-		}
-	}
-	return positioned(fn, sink.findings)
+	return reached
 }
 
 // laterCalls caches the calls a function makes outside its straight-line flow:
 // defers, which run when it exits, and goroutines, which run at an unknown
-// moment. Both observe the exit state, so both are judged against it. The list
-// is replayed once per returning block, and rescanning every instruction each
-// time made that quadratic in the size of the function.
+// moment. The list is consulted at every returning block of every solve round
+// and at every RunDefers, and rescanning every instruction each time made that
+// quadratic in the size of the function.
 func (e *engine) laterCalls(fn *ssa.Function) []ssa.CallInstruction {
 	if cached, ok := e.later[fn]; ok {
 		return cached
@@ -789,37 +936,16 @@ func boundMethodCalledInPlace(closure *ssa.MakeClosure) bool {
 	return true
 }
 
-// positioned anchors findings whose call carries no position. Dropping them
-// would be silent, and reporting at position zero is unreadable.
-func positioned(fn *ssa.Function, findings []sinkFinding) []sinkFinding {
-	for idx := range findings {
-		if !findings[idx].pos.IsValid() {
-			findings[idx].pos = fn.Pos()
-		}
-	}
-	return findings
-}
-
-func blockReturns(block *ssa.BasicBlock) bool {
-	_, ok := block.Instrs[len(block.Instrs)-1].(*ssa.Return)
-	return ok
-}
-
-func blockTerminates(block *ssa.BasicBlock) bool {
-	switch block.Instrs[len(block.Instrs)-1].(type) {
-	case *ssa.Return, *ssa.Panic:
-		return true
-	default:
-		return false
-	}
-}
-
 // remember records what is known about an SSA register, but only when it says
 // something a plain lookup would not. A frame is copied once per block visit,
 // so entries that read back identically are pure weight: in generated code a
 // single function can hold thousands of conversions and phis over types the
 // analyzer does not track at all.
 func remember(current *frame, value ssa.Value, known abstractValue) {
+	if _, derived := untrackedAddress(value); derived {
+		delete(current.values, value)
+		return
+	}
 	if known.kind == kindOther && len(known.elems) == 0 && len(known.locs) == 0 && len(known.memLocs) == 0 {
 		delete(current.values, value)
 		return
@@ -851,7 +977,7 @@ func (e *engine) transfer(block *ssa.BasicBlock, instruction ssa.Instruction, cu
 			if location, ok := localLocation(instruction.X); ok {
 				value, ok := current.memory[location]
 				if !ok {
-					value = e.loadAggregate(current, location, instruction.Type())
+					value = loadAggregate(current, location, instruction.Type())
 				}
 				remember(current, instruction, value)
 			}
@@ -859,7 +985,7 @@ func (e *engine) transfer(block *ssa.BasicBlock, instruction ssa.Instruction, cu
 	case *ssa.Phi:
 		value := abstractValue{}
 		for idx, edge := range instruction.Edges {
-			if idx < len(block.Preds) && predecessorOut[block.Preds[idx]] != nil {
+			if predecessorOut[block.Preds[idx]] != nil {
 				value = joinValue(value, e.value(predecessorOut[block.Preds[idx]], edge))
 			}
 		}
@@ -932,19 +1058,18 @@ func (e *engine) transfer(block *ssa.BasicBlock, instruction ssa.Instruction, cu
 		e.invalidateLaterEffects(block.Parent(), current)
 	case *ssa.Go:
 		// A goroutine runs at an unknown moment: it establishes nothing here,
-		// and a sink it carries observes every later mutation. Both are dealt
-		// with against the exit frame, next to deferred calls.
+		// and a sink it carries is judged by observeLaterSinks against every
+		// later state, next to deferred sinks.
 		if !e.isSinkCall(instruction.Common(), current) {
 			e.invalidateCallArguments(instruction.Common(), current)
 		}
 	}
 }
 
-// sinkAt is the single place a call is judged to be a zerolog output. It
-// returns the receiver whose provenance must be proven, or nil when the sink
+// sinkAt is the single place a resolved call is judged to be a zerolog output.
+// It returns the receiver whose provenance must be proven, or nil when the sink
 // is a package-level log function that has no receiver to prove.
-func (e *engine) sinkAt(common *ssa.CallCommon, current *frame) (sinkSpec, ssa.Value) {
-	fn, _, args, invokeReceiver := e.resolvedCall(common)
+func (e *engine) sinkAt(fn *types.Func, args []ssa.Value, invokeReceiver ssa.Value, current *frame) (sinkSpec, ssa.Value) {
 	if spec := classifySink(fn); spec.kind != sinkNone {
 		if isPackageLevelLogSink(fn) {
 			return spec, nil
@@ -963,8 +1088,14 @@ func (e *engine) sinkAt(common *ssa.CallCommon, current *frame) (sinkSpec, ssa.V
 	return sinkSpec{}, nil
 }
 
+// sinkOf resolves the call and judges it with sinkAt.
+func (e *engine) sinkOf(common *ssa.CallCommon, current *frame) (sinkSpec, ssa.Value) {
+	fn, _, args, invokeReceiver := resolvedCall(common)
+	return e.sinkAt(fn, args, invokeReceiver, current)
+}
+
 func (e *engine) isSinkCall(common *ssa.CallCommon, current *frame) bool {
-	spec, _ := e.sinkAt(common, current)
+	spec, _ := e.sinkOf(common, current)
 	return spec.kind != sinkNone
 }
 
@@ -975,19 +1106,44 @@ func (e *engine) withLaterEffects(fn *ssa.Function, current *frame) *frame {
 }
 
 func (e *engine) invalidateLaterEffects(fn *ssa.Function, current *frame) {
+	e.invalidateCalls(current, e.laterEffects(fn, func(common *ssa.CallCommon) bool { return e.isSinkCall(common, current) }))
+}
+
+// laterEffects is every deferred or concurrent call of fn that is not a sink:
+// the calls whose effects happen after their statement.
+func (e *engine) laterEffects(fn *ssa.Function, isSink func(*ssa.CallCommon) bool) []*ssa.CallCommon {
+	var effects []*ssa.CallCommon
 	for _, later := range e.laterCalls(fn) {
-		if !e.isSinkCall(later.Common(), current) {
-			e.invalidateCallArguments(later.Common(), current)
+		if !isSink(later.Common()) {
+			effects = append(effects, later.Common())
 		}
+	}
+	return effects
+}
+
+func (e *engine) invalidateCalls(current *frame, calls []*ssa.CallCommon) {
+	for _, common := range calls {
+		e.invalidateCallArguments(common, current)
 	}
 }
 
+// reaches reports whether invalidating value could change anything in current:
+// whether it is an address or reaches an event, a memory location or an
+// aggregate. It mirrors the routes invalidateEscape follows.
+func (e *engine) reaches(current *frame, value ssa.Value) bool {
+	if _, ok := localLocation(value); ok {
+		return true
+	}
+	known := e.value(current, value)
+	return len(known.locs) != 0 || len(known.memLocs) != 0 || len(known.elems) != 0
+}
+
 // invalidateCallArguments widens everything a callee could reach through the
-// call, receiver included.
+// call, including the receiver or the function value it dispatches on.
 func (e *engine) invalidateCallArguments(common *ssa.CallCommon, current *frame) {
-	_, _, args, invokeReceiver := e.resolvedCall(common)
+	_, _, args, invokeReceiver := resolvedCall(common)
 	if invokeReceiver != nil {
-		args = append([]ssa.Value{invokeReceiver}, args...)
+		e.invalidateEscape(current, invokeReceiver)
 	}
 	for _, arg := range args {
 		e.invalidateEscape(current, arg)
@@ -1025,7 +1181,13 @@ func forgetReachable(current *frame, value abstractValue) {
 // to callers.
 func writeEvent(current *frame, location eventLocation, state eventState) {
 	current.events[location] = state
-	if parameter, ok := location.value.(*ssa.Parameter); ok {
+	markParamWrite(current, location.value)
+}
+
+// markParamWrite notes that state rooted at a parameter changed, which is what
+// makes the change visible to callers as a parameter effect.
+func markParamWrite(current *frame, root ssa.Value) {
+	if parameter, ok := root.(*ssa.Parameter); ok {
 		current.writes[parameter] = true
 	}
 }
@@ -1050,12 +1212,9 @@ func updateEvent(current *frame, value abstractValue, state eventState) {
 // writeMemory records a value at a location and notes a parameter-rooted write.
 func writeMemory(current *frame, location memoryLocation, value abstractValue) {
 	current.memory[location] = value
-	if parameter, ok := location.root.(*ssa.Parameter); ok {
-		current.writes[parameter] = true
-	}
+	markParamWrite(current, location.root)
 }
 
-// forgetMemory widens a location and every field nested inside it.
 // forgetMemory widens a location, every field nested inside it, and everything
 // the values stored there could reach. Each location is widened before its
 // contents are followed, which is what terminates the walk: a location reached
@@ -1068,9 +1227,7 @@ func forgetMemory(current *frame, root memoryLocation) {
 		current.memory[location] = unknownValue(stored.kind)
 		forgetReachable(current, stored)
 	}
-	if parameter, ok := root.root.(*ssa.Parameter); ok {
-		current.writes[parameter] = true
-	}
+	markParamWrite(current, root.root)
 }
 
 func storeValue(current *frame, location memoryLocation, value abstractValue) {
@@ -1135,13 +1292,13 @@ func localLocation(value ssa.Value) (memoryLocation, bool) {
 }
 
 func trackedPointerKind(t types.Type) valueKind {
-	if _, ok := unalias(t).(*types.Pointer); !ok {
+	if _, ok := types.Unalias(t).(*types.Pointer); !ok {
 		return kindOther
 	}
 	return kindOf(t)
 }
 
-func (e *engine) loadAggregate(current *frame, location memoryLocation, t types.Type) abstractValue {
+func loadAggregate(current *frame, location memoryLocation, t types.Type) abstractValue {
 	structure, ok := deref(t).Underlying().(*types.Struct)
 	if !ok {
 		return unknownValue(kindOf(t))
@@ -1164,49 +1321,35 @@ func fieldPath(parent string, field int) string {
 }
 
 // resolvedCall returns the callee object, its SSA body when statically known,
-// the call arguments and the receiver of an interface dispatch.
+// the call arguments, and the value dispatched on: the receiver of an
+// interface invoke, or the function value of a dynamic call.
 //
 // The returned args are not uniformly aligned with the callee's parameters: an
 // invoke strips the receiver into the fourth result, a synthetic closure has
 // its bindings prepended, and a static call keeps the receiver at args[0].
 // Anything indexing a summary by parameter position must account for that.
-func (e *engine) resolvedCall(common *ssa.CallCommon) (*types.Func, *ssa.Function, []ssa.Value, ssa.Value) {
-	if common == nil {
-		return nil, nil, nil, nil
-	}
+func resolvedCall(common *ssa.CallCommon) (*types.Func, *ssa.Function, []ssa.Value, ssa.Value) {
 	if common.IsInvoke() {
 		return common.Method, nil, common.Args, common.Value
 	}
-	if closure, ok := common.Value.(*ssa.MakeClosure); ok {
-		if target, ok := closure.Fn.(*ssa.Function); ok {
-			object, _ := target.Object().(*types.Func)
-			args := common.Args
-			if target.Synthetic != "" {
-				args = append(slices.Clone(closure.Bindings), args...)
-			}
-			return object, target, args, nil
-		}
+	callee := common.StaticCallee()
+	if callee == nil {
+		return nil, nil, common.Args, common.Value
 	}
-	if callee := common.StaticCallee(); callee != nil {
-		object, _ := callee.Object().(*types.Func)
-		return object, callee, common.Args, nil
+	object, _ := callee.Object().(*types.Func)
+	args := common.Args
+	if closure, ok := common.Value.(*ssa.MakeClosure); ok && callee.Synthetic != "" {
+		args = slices.Concat(closure.Bindings, args)
 	}
-	return nil, nil, common.Args, common.Value
+	return object, callee, args, nil
 }
 
 func (e *engine) handleCall(result ssa.Value, common *ssa.CallCommon, current *frame, sink *collector) {
-	fn, callee, args, _ := e.resolvedCall(common)
-	if spec, receiver := e.sinkAt(common, current); spec.kind != sinkNone {
-		// A nil receiver means nothing can be proven about this output.
-		state, nilCtx := stateUnknown, false
-		if receiver != nil {
-			receiverValue := e.value(current, receiver)
-			state = receiverValue.effectiveState(current)
-			nilCtx = receiverValue.finalCtxWasNil(current)
-		}
-		if sink != nil && !sink.seen[common] {
+	fn, callee, args, invokeReceiver := resolvedCall(common)
+	if spec, receiver := e.sinkAt(fn, args, invokeReceiver, current); spec.kind != sinkNone {
+		if sink != nil {
+			state, nilCtx := e.observe(receiver, current)
 			sink.findings = append(sink.findings, sinkFinding{pos: common.Pos(), state: state, spec: spec, nilCtx: nilCtx})
-			sink.seen[common] = true
 		}
 		return
 	}
@@ -1216,37 +1359,46 @@ func (e *engine) handleCall(result ssa.Value, common *ssa.CallCommon, current *f
 		}
 	}
 
-	if fn != nil {
-		if fn.Pkg() != nil && fn.Pkg().Path() == zerologPkgPath {
-			e.handleZerologCall(result, fn, args, current)
-			return
-		}
-		summary, ok := e.local[callee]
-		if !ok && fn.Pkg() != nil && fn.Pkg() != e.pass.Pkg {
-			var fact functionSummaryFact
-			if e.pass.ImportObjectFact(fn, &fact) {
-				summary = summaryFromFact(fact)
-				ok = true
-			}
-		}
-		if ok {
-			e.applySummary(result, args, summary, current)
-			return
-		}
+	// Only zerolog's own code has known semantics. A zerolog interface method
+	// dispatches to whatever implements it, which is not zerolog's code.
+	if callee != nil && fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == zerologPkgPath {
+		e.handleZerologCall(result, fn, args, current)
+		return
 	}
-	if callee != nil {
-		if summary, ok := e.local[callee]; ok {
-			e.applySummary(result, args, summary, current)
-			return
-		}
+	if summary, ok := e.summaryOf(fn, callee); ok {
+		e.applySummary(result, args, summary, current)
+		return
 	}
 
-	for _, arg := range args {
-		e.invalidateEscape(current, arg)
-	}
+	e.invalidateCallArguments(common, current)
 	if result != nil {
-		e.setUnknownResult(result, current)
+		bindResult(current, result, func(int) ctxState { return stateUnknown })
 	}
+}
+
+// summaryOf is the one summary lookup: this package's own solution for a body
+// it analyses, otherwise the fact exported for the object, which only another
+// package can have supplied while this one is being solved.
+func (e *engine) summaryOf(object *types.Func, body *ssa.Function) (functionSummary, bool) {
+	if summary, ok := e.local[body]; ok {
+		return summary, true
+	}
+	if object == nil {
+		return functionSummary{}, false
+	}
+	imported, cached := e.imported[object]
+	if !cached {
+		var fact functionSummaryFact
+		if e.pass.ImportObjectFact(object, &fact) {
+			summary := summaryFromFact(fact)
+			imported = &summary
+		}
+		e.imported[object] = imported
+	}
+	if imported == nil {
+		return functionSummary{}, false
+	}
+	return *imported, true
 }
 
 // summaryFromFact clamps anything outside the lattice to unknown. Facts are
@@ -1295,12 +1447,8 @@ func (e *engine) handleZerologCall(result ssa.Value, fn *types.Func, args []ssa.
 			}
 		}
 		if fn.Name() == "Ctx" {
-			state := stateHasContext
-			receiver.nilCtx = false
-			if len(args) < 2 || isNilValue(args[1]) {
-				state = stateNoContext
-				receiver.nilCtx = true
-			}
+			var state ctxState
+			state, receiver.nilCtx = ctxArgState(args)
 			updateEvent(current, receiver, eventState{state: state, ctxWasNil: receiver.nilCtx})
 			if len(receiver.locs) == 0 {
 				receiver.state = state
@@ -1315,12 +1463,7 @@ func (e *engine) handleZerologCall(result ssa.Value, fn *types.Func, args []ssa.
 	case kindBuilder:
 		state := receiver.effectiveState(current)
 		if fn.Name() == "Ctx" {
-			state = stateHasContext
-			receiver.nilCtx = false
-			if len(args) < 2 || isNilValue(args[1]) {
-				state = stateNoContext
-				receiver.nilCtx = true
-			}
+			state, receiver.nilCtx = ctxArgState(args)
 		}
 		if result != nil {
 			kind := kindOf(result.Type())
@@ -1356,9 +1499,7 @@ func (e *engine) handleZerologCall(result ssa.Value, fn *types.Func, args []ssa.
 		}
 		switch kind := kindOf(result.Type()); kind {
 		case kindEvent:
-			location := eventLocation{value: result}
-			current.values[result] = abstractValue{kind: kindEvent, locs: map[eventLocation]struct{}{location: {}}}
-			current.events[location] = eventState{state: state, ctxWasNil: receiver.nilCtx}
+			current.values[result] = freshEvent(current, eventLocation{value: result}, eventState{state: state, ctxWasNil: receiver.nilCtx})
 		case kindBuilder, kindLogger:
 			current.values[result] = abstractValue{kind: kind, state: state, nilCtx: receiver.nilCtx}
 		}
@@ -1368,21 +1509,20 @@ func (e *engine) handleZerologCall(result ssa.Value, fn *types.Func, args []ssa.
 	if result == nil {
 		return
 	}
-	kind := kindOf(result.Type())
 	state := stateUnknown
 	if fn.Name() == "New" || fn.Name() == "Nop" {
 		state = stateNoContext
 	}
-	switch kind {
-	case kindEvent:
-		location := eventLocation{value: result}
-		current.values[result] = abstractValue{kind: kindEvent, locs: map[eventLocation]struct{}{location: {}}}
-		current.events[location] = eventState{state: state}
-	case kindLogger, kindBuilder:
-		current.values[result] = abstractValue{kind: kind, state: state}
-	default:
-		e.setUnknownResult(result, current)
+	bindResult(current, result, func(int) ctxState { return state })
+}
+
+// ctxArgState is what a Ctx call proves, and whether its argument was nil: a
+// missing or nil argument proves there is no context.
+func ctxArgState(args []ssa.Value) (ctxState, bool) {
+	if len(args) < 2 || isNilValue(args[1]) {
+		return stateNoContext, true
 	}
+	return stateHasContext, false
 }
 
 func (e *engine) summaryForFunctionValue(value ssa.Value) (functionSummary, bool) {
@@ -1390,18 +1530,8 @@ func (e *engine) summaryForFunctionValue(value ssa.Value) (functionSummary, bool
 	if fn == nil {
 		return functionSummary{}, false
 	}
-	if summary, ok := e.local[fn]; ok {
-		return summary, true
-	}
 	object, _ := fn.Object().(*types.Func)
-	if object == nil {
-		return functionSummary{}, false
-	}
-	var fact functionSummaryFact
-	if e.pass.ImportObjectFact(object, &fact) {
-		return summaryFromFact(fact), true
-	}
-	return functionSummary{}, false
+	return e.summaryOf(object, fn)
 }
 
 func (e *engine) applySummary(result ssa.Value, args []ssa.Value, summary functionSummary, current *frame) {
@@ -1430,70 +1560,41 @@ func (e *engine) applySummary(result ssa.Value, args []ssa.Value, summary functi
 	if result == nil {
 		return
 	}
-	if tuple, ok := result.Type().(*types.Tuple); ok {
-		value := abstractValue{elems: make([]abstractValue, tuple.Len())}
-		for idx := 0; idx < tuple.Len(); idx++ {
-			kind := kindOf(tuple.At(idx).Type())
-			if kind == kindOther {
-				continue
-			}
-			state := stateUnknown
-			if idx < len(summary.results) {
-				state = summary.results[idx]
-			}
-			value.elems[idx] = abstractValue{kind: kind, state: state}
-			if kind == kindEvent {
-				location := eventLocation{value: result, index: idx}
-				value.elems[idx].state = stateUnreachable
-				value.elems[idx].locs = map[eventLocation]struct{}{location: {}}
-				value.elems[idx] = value.elems[idx].identified()
-				current.events[location] = eventState{state: state}
-			}
+	bindResult(current, result, func(idx int) ctxState {
+		if idx < len(summary.results) {
+			return summary.results[idx]
 		}
-		current.values[result] = value
-		return
-	}
-	kind := kindOf(result.Type())
-	state := stateUnknown
-	if len(summary.results) > 0 {
-		state = summary.results[0]
-	}
-	if kind == kindEvent {
-		location := eventLocation{value: result}
-		current.values[result] = abstractValue{kind: kindEvent, locs: map[eventLocation]struct{}{location: {}}}
-		current.events[location] = eventState{state: state}
-	} else if kind != kindOther {
-		current.values[result] = abstractValue{kind: kind, state: state}
-	}
+		return stateUnknown
+	})
 }
 
-func (e *engine) setUnknownResult(result ssa.Value, current *frame) {
+// bindResult gives a call's result, or each element of its tuple, the context
+// state stateAt proves for that position. An event result is a new event
+// object, identified by the call and the position; any other tracked result
+// has no identity of its own.
+func bindResult(current *frame, result ssa.Value, stateAt func(idx int) ctxState) {
+	bind := func(t types.Type, idx int) abstractValue {
+		switch kind := kindOf(t); kind {
+		case kindEvent:
+			return freshEvent(current, eventLocation{value: result, index: idx}, eventState{state: stateAt(idx)})
+		case kindOther:
+			return topValue
+		default:
+			value := unknownValue(kind)
+			value.state = stateAt(idx)
+			return value
+		}
+	}
 	if tuple, ok := result.Type().(*types.Tuple); ok {
 		value := abstractValue{elems: make([]abstractValue, tuple.Len())}
-		for idx := 0; idx < tuple.Len(); idx++ {
-			kind := kindOf(tuple.At(idx).Type())
-			value.elems[idx] = unknownValue(kind)
-			if kind == kindEvent {
-				location := eventLocation{value: result, index: idx}
-				value.elems[idx].state = stateUnreachable
-				value.elems[idx].locs = map[eventLocation]struct{}{location: {}}
-				value.elems[idx] = value.elems[idx].identified()
-				current.events[location] = eventState{state: stateUnknown}
-			}
+		for idx := range tuple.Len() {
+			value.elems[idx] = bind(tuple.At(idx).Type(), idx)
 		}
 		current.values[result] = value
 		return
 	}
-	if kind := kindOf(result.Type()); kind != kindOther {
-		value := unknownValue(kind)
-		if kind == kindEvent {
-			location := eventLocation{value: result}
-			value.locs = map[eventLocation]struct{}{location: {}}
-			value = value.identified()
-			value.state = stateUnreachable
-			current.events[location] = eventState{state: stateUnknown}
-		}
-		current.values[result] = value
+	if kindOf(result.Type()) != kindOther {
+		current.values[result] = bind(result.Type(), 0)
 	}
 }
 

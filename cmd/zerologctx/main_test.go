@@ -2,8 +2,8 @@ package main
 
 import (
 	"errors"
-	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -16,13 +16,7 @@ func TestMainHelp(t *testing.T) {
 		t.Skip("go toolchain not available in PATH")
 	}
 
-	tmp, err := os.MkdirTemp("", "zerologctx-cli-")
-	if err != nil {
-		t.Fatalf("mkdir temp: %v", err)
-	}
-	defer os.RemoveAll(tmp)
-
-	bin := tmp + "/zerologctx"
+	bin := filepath.Join(t.TempDir(), "zerologctx")
 	build := exec.Command("go", "build", "-o", bin, ".")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build failed: %v\n%s", err, out)

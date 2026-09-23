@@ -175,7 +175,7 @@ func boundMethodEscapes(ctx context.Context) {
 // mutation the spawning function performs afterwards.
 func goSinkObservesLaterMutation(ctx context.Context) {
 	event := log.Info().Ctx(ctx)
-	go event.Msg("the goroutine may run after the context is cleared") // want `zerolog output's final Ctx\(\) argument is nil before Msg\(\)`
+	go event.Msg("the goroutine may run before or after the context is cleared") // want `zerolog output is not proven to carry context before Msg\(\)`
 	event.Ctx(nil)
 }
 
