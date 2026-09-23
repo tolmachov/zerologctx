@@ -47,6 +47,8 @@ pinned `github.com/rs/zerolog v1.35.1`. Do not reintroduce a local zerolog stub.
 - `strictpkg` covers control flow, aliases, memory, sink forms, summaries, and
   suppressions;
 - `summaryprovider` and `summaryconsumer` cover exported analysis facts;
+- `indirectconsumer` handles a zerolog value without importing zerolog and must
+  still be analysed;
 - `fixpkg` verifies suggested edits and recompiles the fully fixed source;
 - `pluginfixture` is executed by a real custom golangci-lint binary.
 

@@ -37,8 +37,11 @@ First public release. Nothing has shipped before it, so everything below is new.
 - Fail-closed treatment of everything the analyzer cannot follow: values
   captured by closures, escaping method values, writes through unresolved
   addresses, stores into slices, maps, channels and globals, aggregates passed
-  by value, mutable globals, receiver fields and opaque calls all stay unknown
-  and are reported.
+  by value, mutable globals, receiver fields, opaque calls, and
+  `Logger.UpdateContext` and `Event.Func` callbacks without a provable summary
+  all stay unknown and are reported.
+- Package-level `log.Print` and `log.Printf` take no context and are always
+  reported.
 - Goroutines establish nothing where they are spawned. A sink a goroutine or a
   deferred call carries is judged against every state from its statement
   through function exit, with the function's other deferred calls applied:
@@ -63,4 +66,4 @@ First public release. Nothing has shipped before it, so everything below is new.
   it is absent, diagnostics are still emitted; only suggested fixes are
   withheld.
 
-[Unreleased]: https://github.com/tolmachov/zerologctx/compare/main...HEAD
+[Unreleased]: https://github.com/tolmachov/zerologctx/commits/main
