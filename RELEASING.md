@@ -10,7 +10,9 @@ commit has merged to `main`.
       golangci-lint v2.13.2 binary.
 - [ ] Confirm `git status --short` is empty.
 - [ ] Move the `[Unreleased]` contents to `[1.0.0] - YYYY-MM-DD` and recreate an
-      empty `[Unreleased]` section.
+      empty `[Unreleased]` section. Point the `[Unreleased]` link at
+      `compare/v1.0.0...HEAD` and add a `[1.0.0]` link to
+      `releases/tag/v1.0.0`.
 - [ ] Create and push the annotated `v1.0.0` tag.
 - [ ] Create the GitHub Release from the `v1.0.0` changelog.
 - [ ] Verify `go install github.com/tolmachov/zerologctx/cmd/zerologctx@v1.0.0`.

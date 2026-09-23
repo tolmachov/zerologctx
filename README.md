@@ -35,6 +35,14 @@ go install github.com/tolmachov/zerologctx/cmd/zerologctx@latest
 zerologctx ./...
 ```
 
+Apply the suggested fixes described below with `-fix`; add `-diff` to print
+them as a unified diff instead of rewriting files:
+
+```bash
+go tool zerologctx -fix -diff ./...
+go tool zerologctx -fix ./...
+```
+
 The public library entry point remains `zerologctx.Analyzer` for analysis
 drivers that compose analyzers directly.
 
@@ -65,11 +73,21 @@ These zerolog v1.35.1 sinks are checked:
 - `zerolog.Logger.Print`, `Printf`, `Println`, and `Write`;
 - package-level `log.Print` and `log.Printf`.
 
+Package-level `log.Print` and `log.Printf` write through the global logger and
+take no context, so they are always reported. Replace them with an event that
+attaches one, such as `log.Info().Ctx(ctx).Msg(...)`, or suppress them.
+
 `Ctx` is order-sensitive and overwrites the previous state:
 
 ```go
 log.Info().Ctx(ctx).Ctx(nil).Msg("reported: final context is nil")
 log.Info().Ctx(nil).Ctx(ctx).Msg("safe: final context is attached")
+```
+
+A final `Ctx(nil)` has its own message and no suggested fix:
+
+```text
+zerolog output's final Ctx() argument is nil before Msg()
 ```
 
 `zerolog.Ctx(ctx)` and `log.Ctx(ctx)` retrieve a logger *from* a context; they
@@ -82,8 +100,9 @@ log.Ctx(ctx).Info().Ctx(ctx).Msg("safe")
 
 Logger derivations such as `With`, `Logger`, `Level`, `Output`, `Sample`, and
 `Hook` preserve the proof. Local and imported function summaries carry only
-proven result and pointer-mutation postconditions. Unknown calls and
-`UpdateContext` callbacks without a provable summary invalidate the proof.
+proven result and pointer-mutation postconditions. Unknown calls, and
+`Logger.UpdateContext` and `Event.Func` callbacks without a provable summary,
+invalidate the proof.
 Mutable globals, receiver fields, and opaque values are never made safe by an
 unrelated assignment elsewhere in the package.
 
@@ -111,8 +130,9 @@ Suppress an intentional sink at that sink:
 log.Info().Msg("intentional") //nolint:zerologctx // explain why
 ```
 
-Bare `//nolint`, `//nolint:all`, and a standalone directive immediately above
-the sink are also supported.
+The directive may sit at the end of any line the call spans, or on a line of
+its own directly above the call. Bare `//nolint` and `//nolint:all` also
+suppress.
 
 ## Static-analysis boundary
 
@@ -120,8 +140,9 @@ Reflection and fully dynamic calls that cannot be statically linked to a
 zerolog method are outside the analyzer's boundary — a sink it cannot recognize
 is a sink it cannot report. `emit := event.Msg; emit("x")` is recognized;
 storing that same method value in a struct field and calling it through the
-field is not. Statically resolved interface dispatch is supported. Unreachable code is not analyzed, so an output operation that can
-never execute is never reported.
+field is not. Statically resolved interface dispatch is supported. Unreachable
+code is not analyzed, so an output operation that can never execute is never
+reported.
 
 Once a sink is recognized, unknown provenance is reported. The only way to
 silence a recognized sink is the `//nolint` directive above.
