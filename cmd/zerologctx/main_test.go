@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -38,5 +39,31 @@ func TestMainHelp(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "zerologctx") {
 		t.Errorf("binary -h output did not mention zerologctx: %s", out)
+	}
+}
+
+// TestMainReportsDiagnostics runs the binary on a fixture package with an
+// unproven sink: singlechecker must print the diagnostic and exit with 3.
+func TestMainReportsDiagnostics(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available in PATH")
+	}
+
+	bin := filepath.Join(t.TempDir(), "zerologctx")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(bin, "./logonlypkg")
+	cmd.Dir = filepath.Join("..", "..", "testdata")
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("binary exited with %v, want status 3 for a reported diagnostic\noutput: %s", err, out)
+	}
+	if !strings.Contains(string(out), "zerolog output is not proven to carry context before Print()") {
+		t.Errorf("binary output did not contain the diagnostic: %s", out)
 	}
 }

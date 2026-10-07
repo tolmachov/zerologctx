@@ -21,9 +21,10 @@ output="$({
 status=$?
 set -e
 
-if [[ $status -ne 1 ]]; then
+count="$(grep -cF "zerolog output is not proven to carry context before Msg()" <<<"$output" || true)"
+if [[ $status -ne 1 || $count -ne 1 ]]; then
   printf '%s\n' "$output"
-  echo "expected the integration fixture to fail with one zerologctx diagnostic" >&2
+  echo "expected the integration fixture to fail with exactly one zerologctx diagnostic, got $count" >&2
   exit 1
 fi
-grep -F "zerolog output is not proven to carry context before Msg()" <<<"$output"
+printf '%s\n' "$output"

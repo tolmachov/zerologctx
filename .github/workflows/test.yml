@@ -34,6 +34,9 @@ jobs:
           go mod verify
           (cd testdata && go mod download && go mod tidy -diff && go mod verify)
 
+      - name: Check the zerolog model against zerolog
+        run: (cd testdata && GOWORK=off go test ./oracle/)
+
       - name: Build
         run: go build ./...
 

@@ -24,7 +24,7 @@ func consume(ctx context.Context) {
 	logger.Info().Msg("safe builder pointer effect")
 	logger = zerolog.New(io.Discard)
 	logger.UpdateContext(summaryprovider.AttachBackground)
-	logger.Info().Msg("safe imported callback summary")
+	logger.Info().Msg("UpdateContext never attaches the callback's context") // want `zerolog output is not proven to carry context before Msg\(\)`
 	logger = zerolog.New(io.Discard).With().Ctx(ctx).Logger()
 	summaryprovider.ResetAny(&logger)
 	logger.Info().Msg("boxed pointer reset across package") // want `zerolog output is not proven to carry context before Msg\(\)`
@@ -33,4 +33,13 @@ func consume(ctx context.Context) {
 	logger.Info().Msg("safe regardless of declaration order")
 	logger = summaryprovider.PlainLogger()
 	logger.Info().Msg("proven to carry no context") // want `zerolog output is not proven to carry context before Msg\(\)`
+
+	keptAway := zerolog.New(io.Discard)
+	kept := summaryprovider.KeepLogger(&keptAway, ctx)
+	kept.Info().Msg("safe result of an escaping callee")
+	keptAway = keptAway.With().Ctx(ctx).Logger()
+	summaryprovider.ResetKept()
+	keptAway.Info().Msg("written through the alias the callee kept") // want `zerolog output is not proven to carry context before Msg\(\)`
+
+	log.Info().Ctx(ctx).Func(summaryprovider.Clearer{}.Clear).Msg("the imported bound method cleared it") // want `zerolog output is not proven to carry context before Msg\(\)`
 }

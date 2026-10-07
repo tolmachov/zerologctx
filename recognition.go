@@ -7,21 +7,15 @@ const (
 	zerologLogPath = "github.com/rs/zerolog/log"
 )
 
-type sinkKind uint8
-
-const (
-	sinkNone sinkKind = iota
-	sinkEvent
-	sinkLogger
-)
-
+// sinkSpec describes an output operation: the kind of value whose context it
+// writes, kindOther when the call is not an output, and the method name the
+// diagnostic quotes.
 type sinkSpec struct {
-	kind sinkKind
-	name string
+	receiver valueKind
+	name     string
 }
 
-var eventSinks = map[string]bool{"Msg": true, "Msgf": true, "MsgFunc": true, "Send": true}
-var loggerSinks = map[string]bool{"Print": true, "Printf": true, "Println": true, "Write": true}
+func (s sinkSpec) isSink() bool { return s.receiver != kindOther }
 
 func deref(t types.Type) types.Type {
 	for {
@@ -67,27 +61,23 @@ func receiverType(fn *types.Func) types.Type {
 	return nil
 }
 
-// sinkForKind is the one table lookup deciding whether a method call on a
-// zerolog value ends an output operation. Both the statically typed and the
+// sinkForKind is the one lookup deciding whether a method call on a zerolog
+// value ends an output operation. Both the statically typed and the
 // dynamically resolved path go through it, so there is one answer.
 func sinkForKind(kind valueKind, name string) sinkSpec {
-	switch kind {
-	case kindEvent:
-		if eventSinks[name] {
-			return sinkSpec{kind: sinkEvent, name: name}
-		}
-	case kindLogger:
-		if loggerSinks[name] {
-			return sinkSpec{kind: sinkLogger, name: name}
-		}
+	switch {
+	case kind == kindEvent && (name == "Msg" || name == "Msgf" || name == "MsgFunc" || name == "Send"),
+		kind == kindLogger && (name == "Print" || name == "Printf" || name == "Println" || name == "Write"):
+		return sinkSpec{receiver: kind, name: name}
+	default:
+		return sinkSpec{}
 	}
-	return sinkSpec{}
 }
 
-// isPackageLevelLogSink reports whether fn belongs to zerolog's log package.
-// Those functions take the message as their first argument, not a receiver, so
-// there is no provenance to prove.
-func isPackageLevelLogSink(fn *types.Func) bool {
+// inZerologLogPackage reports whether fn is declared in zerolog's log package.
+// Its Print and Printf write through the global logger and take no receiver,
+// so a sink there has no provenance to prove.
+func inZerologLogPackage(fn *types.Func) bool {
 	return fn != nil && fn.Pkg() != nil && fn.Pkg().Path() == zerologLogPath
 }
 
@@ -98,8 +88,8 @@ func classifySink(fn *types.Func) sinkSpec {
 	if recv := receiverType(fn); recv != nil {
 		return sinkForKind(kindOf(recv), fn.Name())
 	}
-	if isPackageLevelLogSink(fn) && (fn.Name() == "Print" || fn.Name() == "Printf") {
-		return sinkSpec{kind: sinkLogger, name: fn.Name()}
+	if inZerologLogPackage(fn) && (fn.Name() == "Print" || fn.Name() == "Printf") {
+		return sinkSpec{receiver: kindLogger, name: fn.Name()}
 	}
 	return sinkSpec{}
 }

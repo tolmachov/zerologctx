@@ -31,7 +31,7 @@ func BenchmarkFrameJoin(b *testing.B) {
 		}
 		left.memory[memory] = abstractValue{kind: kindLogger, state: stateHasContext}
 		right.memory[memory] = abstractValue{kind: kindLogger, state: stateNoContext}
-		left.events[event] = eventState{state: stateHasContext, ctxWasNil: true}
+		left.events[event] = eventState{state: stateHasContext, nilCtx: true}
 		right.events[event] = eventState{state: stateNoContext}
 		right.writes[&ssa.Parameter{}] = true
 	}

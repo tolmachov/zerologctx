@@ -245,7 +245,7 @@ func attachThroughUpdateContext(logger *zerolog.Logger, ctx context.Context) {
 func updateContextOnParameter(ctx context.Context) {
 	logger := zerolog.New(io.Discard)
 	attachThroughUpdateContext(&logger, ctx)
-	logger.Info().Msg("the helper attached through UpdateContext")
+	logger.Info().Msg("UpdateContext never attaches the callback's context") // want `zerolog output is not proven to carry context before Msg\(\)`
 }
 
 func nolintScope(ctx context.Context) {
@@ -430,7 +430,7 @@ func deferredSinkAfterDeferredClear(ctx context.Context) {
 
 type dropOnMarshal struct{}
 
-func (dropOnMarshal) MarshalZerologObject(event *zerolog.Event) { event.Ctx(nil) } // want MarshalZerologObject:"zerolog context summary results=\\[\\] effects=\\[preserved no-context\\]"
+func (dropOnMarshal) MarshalZerologObject(event *zerolog.Event) { event.Ctx(nil) } // want MarshalZerologObject:"zerolog context summary results=\\[\\] returns=\\[\\] effects=\\[preserved no-context\\] escapes=\\[false false\\]"
 
 // A zerolog interface dispatches to whatever implements it, which is not
 // zerolog's own code.
