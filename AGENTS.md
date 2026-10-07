@@ -19,18 +19,19 @@ diagnostic, never a pass.
 - `zerologctx.go` — `Analyzer`, `run`, the state lattice and exported summary
   facts. SSA is built per package in `buildPackageSSA` (on top of `ctrlflow`,
   deliberately not `buildssa`) and skipped entirely when
-  `usesZerologValues` finds no zerolog-typed value.
+  `refersToZerolog` finds neither a zerolog object nor a zerolog-typed value.
 - `dataflow.go` — abstract values, frames, the engine, per-SCC summary solving,
-  and `invalidateEscape`.
+  the zerolog transfer rules, `invalidateEscape` and `forgetEscaped`.
 - `recognition.go` — zerolog sink identification via `go/types`
-  (`eventSinks`, `loggerSinks`).
+  (`sinkForKind`, `classifySink`).
 - `reporting.go` — diagnostics, `//nolint` handling, and the `.Ctx(expr)`
   suggested fix.
 - `cmd/zerologctx/` — `singlechecker` CLI.
 - `plugin/` — golangci-lint v2 module plugin.
 - `testdata/` — an independent Go module using the real zerolog v1.35.1:
   `strictpkg`, `summaryprovider`/`summaryconsumer`, `indirectconsumer`,
-  `fixpkg` (+ `.golden`), `pluginfixture`.
+  `logonlypkg`, `fixpkg` (+ `.golden`), `pluginfixture`, and `oracle`, a plain
+  Go test of the zerolog model against the library.
 - `scripts/verify-plugin.sh` — builds and runs a custom golangci-lint binary.
 
 ## Commands
@@ -57,10 +58,15 @@ before touching `dataflow.go`.
 - Uncertainty stays a diagnostic. No "probably safe" heuristics.
 - Identify zerolog through canonical package paths and `go/types` objects after
   unaliasing, never by printed type strings.
-- `invalidateEscape` is the single invalidation path and must follow all four
-  routes: syntactic address, `locs`, `memLocs`, `elems`.
+- `invalidateEscape` is the single escape path. It, `forgetEscaped`,
+  `forgetAliased` and `markReachable` must each follow all four routes:
+  syntactic address, `locs`, `memLocs`, `elems`.
 - Postconditions are written only into a location proven to be the one the call
-  touched; may-alias sets are widened, never updated.
+  touched; may-alias sets are widened, never updated. A function's own writes
+  through an alias widen its parameters' targets (`forgetAliased`); calls
+  widen only what escaped (`forgetEscaped`).
+- A transfer rule for a zerolog method must match what zerolog does; pin it in
+  `testdata/oracle` before relying on it.
 - The summary fixpoint joins into the accumulator; do not replace the join with
   assignment or add iteration caps.
 - Globals and receiver fields are opaque mutable storage; no package-wide

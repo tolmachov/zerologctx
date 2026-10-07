@@ -179,11 +179,11 @@ func helperReturns(ctx context.Context, cond bool) {
 }
 
 func updateContext(ctx context.Context) {
-	safe := zerolog.New(io.Discard)
-	safe.UpdateContext(func(builder zerolog.Context) zerolog.Context {
-		return builder.Ctx(ctx)
+	contextual := zerolog.New(io.Discard).With().Ctx(ctx).Logger()
+	contextual.UpdateContext(func(builder zerolog.Context) zerolog.Context {
+		return builder.Str("key", "value")
 	})
-	safe.Info().Msg("safe callback summary")
+	contextual.Info().Msg("UpdateContext keeps the logger's context")
 
 	unknown := zerolog.New(io.Discard)
 	callback := func(builder zerolog.Context) zerolog.Context { return builder }
@@ -224,8 +224,7 @@ func completeEventSinkSet(ctx context.Context) {
 	log.Info().Ctx(ctx).Str("key", "value").Msg("safe event derivation")
 
 	contextual := zerolog.New(io.Discard).With().Ctx(ctx).Logger()
-	derived := contextual.Output(io.Discard).
-		Level(zerolog.InfoLevel).
+	derived := contextual.Level(zerolog.InfoLevel).
 		Sample(nil).
 		Hook(zerolog.HookFunc(func(*zerolog.Event, zerolog.Level, string) {}))
 	derived.Info().Msg("safe logger derivations")

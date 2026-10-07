@@ -41,9 +41,11 @@ Print, Printf, Println and Write; package-level log.Print and log.Printf.
 Ctx is order-sensitive: the last call wins, and a final Ctx(nil) has its own
 diagnostic. Anything the analyzer cannot follow - a value captured by a
 closure, one written into a slice, map, channel or global, a receiver field, an
-opaque call - stays unknown and is reported. A goroutine establishes nothing
-where it is spawned. A sink in a goroutine or a deferred call is judged against
-every state from its statement through function exit.
+opaque call - stays unknown and is reported. Once a variable's address has gone
+somewhere the analyzer cannot follow, a proof about it lasts only until the
+next call or write through an untracked pointer. A goroutine establishes
+nothing where it is spawned. A sink in a goroutine or a deferred call is judged
+against every state from its statement through function exit.
 
 Suppress an individual sink with //nolint:zerologctx, either at the end of a
 line the call spans or on a line of its own directly above it. Bare //nolint
@@ -52,7 +54,7 @@ and //nolint:all also suppress.
 The analyzer has no configuration.`,
 	Requires:  []*analysis.Analyzer{ctrlflow.Analyzer},
 	Run:       run,
-	FactTypes: []analysis.Fact{new(functionSummaryFact)},
+	FactTypes: []analysis.Fact{new(functionSummary)},
 }
 
 type valueKind uint8
@@ -81,9 +83,13 @@ const (
 // joinState is the least upper bound. The bottom is a two-sided identity and
 // the top absorbs, so the join is commutative, associative and idempotent -
 // properties the worklist relies on for its result to be independent of the
-// order in which predecessors are merged. Treating the bottom as an identity
-// is only sound because it appears exclusively where a path is genuinely
-// unreachable; every other "nothing proven" is the top.
+// order in which predecessors are merged.
+//
+// The bottom means "no path contributed": an unreachable path, an event whose
+// state lives in frame.events rather than in the value, a preserved parameter,
+// or a summary slot not yet solved. It is never read as a proof:
+// effectiveState turns it into unknown for every tracked value before a sink
+// is judged.
 func joinState(a, b ctxState) ctxState {
 	if a == stateUnreachable {
 		return b
@@ -107,21 +113,31 @@ func (s ctxState) String() string {
 	}
 }
 
-// functionSummaryFact carries a function's proven postconditions across
-// package boundaries. Both vectors hold raw ctxState values in one encoding:
-// stateUnreachable means nothing was proven for that entry — for a result it
-// is no proof, for a parameter it is "the callee preserves the argument". An
-// entry is never implicitly safe, and a function with no proof at all exports
-// no fact, so a missing fact reads as unknown.
-type functionSummaryFact struct {
+// functionSummary is a function's proven postconditions, and the fact that
+// carries them across package boundaries. Both state vectors hold raw ctxState
+// values. For a result the bottom proves nothing, and callers read it as
+// unknown. For a parameter it means no path wrote through it: the callee
+// preserves the argument. ResultParams holds, per result, the 1-based position
+// of the parameter that result certainly is; 0 while no exit has been seen,
+// notAParam for anything else. ParamEscapes marks a
+// parameter whose target the callee may leave reachable from somewhere the
+// caller cannot see - a global, the heap, a result other than itself, a
+// goroutine - after it returns.
+//
+// Preservation and non-escape are not proofs on their own: a function with no
+// has-context or no-context entry exports no fact, so callers in other
+// packages treat it as unknown.
+type functionSummary struct {
 	Results      []ctxState
+	ResultParams []int
 	ParamEffects []ctxState
+	ParamEscapes []bool
 }
 
-func (*functionSummaryFact) AFact() {}
+func (*functionSummary) AFact() {}
 
-func (f *functionSummaryFact) String() string {
-	return fmt.Sprintf("zerolog context summary results=%v effects=%v", f.Results, renderEffects(f.ParamEffects))
+func (s *functionSummary) String() string {
+	return fmt.Sprintf("zerolog context summary results=%v returns=%v effects=%v escapes=%v", s.Results, s.ResultParams, renderEffects(s.ParamEffects), s.ParamEscapes)
 }
 
 // renderEffects spells out what the bottom state means for a parameter, so the
@@ -143,11 +159,10 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, nil
 	}
 	// Being in zerolog's import graph is not the same as using it. Most
-	// packages of a large repository never name a zerolog value, and building
-	// SSA for them is what made the analyzer unaffordable: it is by far the
-	// most expensive thing this analyzer does, and for those packages it
-	// produces nothing to report and nothing to export.
-	if !usesZerologValues(pass.TypesInfo) {
+	// packages of a large repository never refer to zerolog, and building SSA
+	// is by far the most expensive thing this analyzer does; for those
+	// packages it produces nothing to report and nothing to export.
+	if !refersToZerolog(pass.TypesInfo) {
 		return nil, nil
 	}
 	srcFuncs, err := buildPackageSSA(pass)
@@ -166,18 +181,19 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// usesZerologValues reports whether the package's own code manipulates a
-// zerolog Logger, Event or Context. It asks about types rather than imports,
-// because a package can use a value obtained from elsewhere without naming
-// zerolog itself.
-func usesZerologValues(info *types.Info) bool {
-	for _, typeAndValue := range info.Types {
-		if kindOf(typeAndValue.Type) != kindOther {
+// refersToZerolog reports whether the package's own code names anything
+// declared by zerolog or its log package, or holds a value of a zerolog type.
+// The first catches the log package's sinks, which take no zerolog value, and
+// methods promoted from an embedded zerolog field; the second catches a value
+// obtained from elsewhere without naming zerolog at all.
+func refersToZerolog(info *types.Info) bool {
+	for _, object := range info.Uses {
+		if pkg := object.Pkg(); pkg != nil && (pkg.Path() == zerologPkgPath || pkg.Path() == zerologLogPath) {
 			return true
 		}
 	}
-	for _, object := range info.Defs {
-		if object != nil && kindOf(object.Type()) != kindOther {
+	for _, typeAndValue := range info.Types {
+		if kindOf(typeAndValue.Type) != kindOther {
 			return true
 		}
 	}

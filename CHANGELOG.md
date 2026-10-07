@@ -14,17 +14,26 @@ First public release. Nothing has shipped before it, so everything below is new.
   module plugin. Every statically identifiable zerolog output operation must be
   proven to carry a `context.Context`; missing and unknown provenance are both
   reported, whether or not a context is in scope.
-- Checked sinks: `(*zerolog.Event).Msg`, `Msgf`, `MsgFunc` and `Send`;
-  `zerolog.Logger` `Print`, `Printf`, `Println` and `Write`; package-level
-  `log.Print` and `log.Printf`.
+- Checked sinks: Event methods `Msg`, `Msgf`, `MsgFunc` and `Send`; Logger
+  methods `Print`, `Printf`, `Println` and `Write`; package-level `log.Print`
+  and `log.Printf`, including in a package that holds no zerolog value of its
+  own.
+- A model of zerolog v1.35.1 checked against the library itself: `Output`
+  drops the logger's context, `UpdateContext` neither attaches nor removes one,
+  `CreateDict` returns a new event seeded from its parent, and `Func`, `Object`
+  and `EmbedObject` hand the event to user code whose summary decides the
+  result.
 - Provenance through SSA control flow, aliases, local memory, stores and loads,
   `Phi` nodes, reassignment, promoted methods, method expressions, method
   values and statically resolved interface dispatch. At a join, context is
   proven only when every reachable path proves it.
 - Function summaries carrying proven result and pointer-mutation
-  postconditions, solved per strongly connected component and exported as
-  analysis facts across package boundaries. A function with nothing proven
-  exports no fact, and a missing fact reads as unknown.
+  postconditions, which parameter each result returns, and whether each
+  pointer parameter escapes, solved per
+  strongly connected component and exported as analysis facts across package
+  boundaries. A function with nothing proven exports no fact, and a missing
+  fact reads as unknown. A path that resumes after a recovered panic
+  contributes to the summary.
 - Order-sensitive `Ctx`: the last call wins, and a final `Ctx(nil)` has its own
   diagnostic.
 - Suggested fixes that insert `.Ctx(expr)` before an ordinary Event selector
@@ -37,14 +46,24 @@ First public release. Nothing has shipped before it, so everything below is new.
 - Fail-closed treatment of everything the analyzer cannot follow: values
   captured by closures, escaping method values, writes through unresolved
   addresses, stores into slices, maps, channels and globals, aggregates passed
-  by value, mutable globals, receiver fields, opaque calls, and
-  `Logger.UpdateContext` and `Event.Func` callbacks without a provable summary
-  all stay unknown and are reported.
+  by value, mutable globals, receiver fields, opaque calls, and `Event.Func`,
+  `Object` and `EmbedObject` callbacks without a provable summary all stay
+  unknown and are reported.
+- Escape tracking: once a variable's or an event's address has gone somewhere
+  the analyzer cannot follow, a proof about it lasts only until the next call
+  or the next write through an untracked pointer. Parameters may alias each
+  other and globals, so a function's own write through another parameter, a
+  global or an untracked pointer widens what its parameters denote. A pointer
+  is read through at every use, so a later store to its target is never
+  missed.
+- A call site in a loop that creates an event while an earlier iteration's
+  event is still held gives neither a proof meant for the other.
 - Package-level `log.Print` and `log.Printf` take no context and are always
   reported.
 - Goroutines establish nothing where they are spawned. A sink a goroutine or a
   deferred call carries is judged against every state from its statement
-  through function exit, with the function's other deferred calls applied:
+  through function exit, with the function's other deferred and goroutine
+  calls applied:
   the goroutine may run at any of them, and the deferred call runs on a panic
   at any of them, so a context attached later proves nothing.
 - A local struct escaping behind an interface or through a channel takes the
@@ -60,8 +79,8 @@ First public release. Nothing has shipped before it, so everything below is new.
 - The analyzer has no settings. A plugin `settings` block is rejected rather
   than ignored.
 - It requires only `ctrlflow`, and needs `LoadModeTypesInfo`. SSA is built
-  per package by the analyzer itself, and only for packages that actually
-  handle a zerolog value.
+  per package by the analyzer itself, and only for packages that refer to
+  zerolog or handle a zerolog value.
 - `context.Context` need not be reachable from a package's import graph. When
   it is absent, diagnostics are still emitted; only suggested fixes are
   withheld.

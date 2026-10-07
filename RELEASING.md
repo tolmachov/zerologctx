@@ -4,8 +4,8 @@ The first public release is `v1.0.0`. Perform these steps only after the release
 commit has merged to `main`.
 
 - [ ] Confirm the full GitHub Actions workflow is green on Go 1.26.1 and 1.27.1.
-- [ ] Run every command in `CONTRIBUTING.md` from a clean checkout. They are
-      all non-mutating, so the tree stays clean.
+- [ ] Run every command in `CONTRIBUTING.md` from a clean checkout. None of
+      them changes tracked files, so the tree stays clean.
 - [ ] Confirm `./scripts/verify-plugin.sh` builds and executes the custom
       golangci-lint v2.13.2 binary.
 - [ ] Confirm `git status --short` is empty.

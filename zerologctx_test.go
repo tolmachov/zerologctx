@@ -15,7 +15,7 @@ import (
 
 func TestAnalyzer(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), Analyzer,
-		"./strictpkg", "./summaryprovider", "./summaryconsumer", "./indirectconsumer")
+		"./strictpkg", "./summaryprovider", "./summaryconsumer", "./indirectconsumer", "./logonlypkg")
 }
 
 func TestSuggestedFixes(t *testing.T) {
@@ -75,6 +75,18 @@ func TestJoinFrameTreatsMissingMemoryAsUnknown(t *testing.T) {
 	}
 }
 
+func TestJoinFrameWidensAggregateMemoryMissingOnOneSide(t *testing.T) {
+	location := memoryLocation{root: &ssa.Alloc{}}
+	safe := newFrame()
+	safe.memory[location] = abstractValue{elems: []abstractValue{{kind: kindLogger, state: stateHasContext}, topValue}}
+
+	joined := newFrame()
+	joinFrame(joined, safe)
+	if got := joined.memory[location].elems[0].state; got != stateUnknown {
+		t.Fatalf("joined field state = %s, want unknown: a path that never wrote the struct proves nothing about its fields", got)
+	}
+}
+
 func TestStateStrings(t *testing.T) {
 	for state, want := range map[ctxState]string{
 		stateUnreachable: "unreachable",
@@ -88,17 +100,42 @@ func TestStateStrings(t *testing.T) {
 	}
 }
 
-func TestSummaryFromFactClampsStatesOutsideTheLattice(t *testing.T) {
-	fact := functionSummaryFact{
+func TestClampSummaryKeepsImportedFactsInsideTheLattice(t *testing.T) {
+	fact := functionSummary{
 		Results:      []ctxState{stateHasContext, 9},
+		ResultParams: []int{1, notAParam},
 		ParamEffects: []ctxState{stateUnreachable, stateNoContext, 200},
+		ParamEscapes: []bool{false, true},
 	}
-	summary := summaryFromFact(fact)
-	if want := []ctxState{stateHasContext, stateUnknown}; !slices.Equal(summary.results, want) {
-		t.Errorf("results = %d, want %d", summary.results, want)
+	summary := clampSummary(fact)
+	if want := []ctxState{stateHasContext, stateUnknown}; !slices.Equal(summary.Results, want) {
+		t.Errorf("results = %d, want %d", summary.Results, want)
 	}
-	if want := []ctxState{stateUnreachable, stateNoContext, stateUnknown}; !slices.Equal(summary.effects, want) {
-		t.Errorf("effects = %d, want %d", summary.effects, want)
+	if want := []int{1, notAParam}; !slices.Equal(summary.ResultParams, want) {
+		t.Errorf("result params = %d, want %d", summary.ResultParams, want)
+	}
+	if want := []ctxState{stateUnreachable, stateNoContext, stateUnknown}; !slices.Equal(summary.ParamEffects, want) {
+		t.Errorf("effects = %d, want %d", summary.ParamEffects, want)
+	}
+	if want := []bool{false, true, true}; !slices.Equal(summary.ParamEscapes, want) {
+		t.Errorf("escapes = %v, want %v: a parameter without an entry escapes", summary.ParamEscapes, want)
+	}
+}
+
+func TestClampSummaryEscapesEveryParameterThroughAnUnknownResult(t *testing.T) {
+	for _, params := range [][]int{nil, {7}, {-2}} {
+		summary := clampSummary(functionSummary{
+			Results:      []ctxState{stateHasContext},
+			ResultParams: params,
+			ParamEffects: []ctxState{stateUnreachable, stateUnreachable},
+			ParamEscapes: []bool{false, false},
+		})
+		if want := []int{notAParam}; !slices.Equal(summary.ResultParams, want) {
+			t.Errorf("result params %v clamp to %d, want %d", params, summary.ResultParams, want)
+		}
+		if want := []bool{true, true}; !slices.Equal(summary.ParamEscapes, want) {
+			t.Errorf("result params %v: escapes = %v, want %v", params, summary.ParamEscapes, want)
+		}
 	}
 }
 

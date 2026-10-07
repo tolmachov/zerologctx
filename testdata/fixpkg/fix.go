@@ -82,3 +82,23 @@ func assignedAfterDeclaration() {
 	_ = ctx
 	log.Info().Msg("declared nil but reassigned before the sink") // want `zerolog output is not proven to carry context before Msg\(\)`
 }
+
+type wrapper struct{ *zerolog.Event }
+
+func noFixForms(ctx context.Context) {
+	wrapper{Event: log.Info()}.Msg("promoted receiver") // want `zerolog output is not proven to carry context before Msg\(\)`
+	logger := zerolog.New(nil)
+	logger.Print("logger print")  // want `zerolog output is not proven to carry context before Print\(\)`
+	logger.Printf("%s", "printf") // want `zerolog output is not proven to carry context before Printf\(\)`
+	logger.Println("println")     // want `zerolog output is not proven to carry context before Println\(\)`
+	_, _ = logger.Write([]byte{}) // want `zerolog output is not proven to carry context before Write\(\)`
+	var sink interface{ Msg(string) } = log.Info()
+	sink.Msg("interface sink")               // want `zerolog output is not proven to carry context before Msg\(\)`
+	log.Info().Ctx(nil).Msg("final nil ctx") // want `zerolog output's final Ctx\(\) argument is nil before Msg\(\)`
+}
+
+func candidateDeclaredLater() {
+	log.Info().Msg("ctx is declared below") // want `zerolog output is not proven to carry context before Msg\(\)`
+	ctx := context.Background()
+	_ = ctx
+}

@@ -18,7 +18,8 @@ type sourceIndex struct {
 	// contextIface is nil when context.Context is not reachable from the import
 	// graph. Only suggested fixes need it; the analysis itself does not.
 	contextIface *types.Interface
-	// nils is built on first use, which is never for a package with no fixes.
+	// nils is built on first use, which is never for a package with no fix
+	// candidate.
 	nils map[*types.Var]*nilFacts
 }
 
@@ -117,7 +118,7 @@ func (e *engine) report(contextIface *types.Interface) error {
 // receivers and the direct Print/Write APIs all have no such position, so
 // their diagnostics carry no fix.
 func (e *engine) fixTarget(spec sinkSpec, call *ast.CallExpr) *ast.SelectorExpr {
-	if spec.kind != sinkEvent || call == nil {
+	if spec.receiver != kindEvent || call == nil {
 		return nil
 	}
 	selector, ok := call.Fun.(*ast.SelectorExpr)
@@ -213,9 +214,8 @@ type nilFacts struct {
 	assignments    []token.Pos
 }
 
-// nilIndex walks the package once and answers for every variable. The previous
-// shape walked every file twice per candidate expression, which made naming a
-// context quadratic in the size of the package.
+// nilIndex walks the package once and answers for every variable, which keeps
+// naming a context linear in the size of the package.
 func (i *sourceIndex) nilIndex() map[*types.Var]*nilFacts {
 	if i.nils != nil {
 		return i.nils
@@ -282,11 +282,13 @@ func (i *sourceIndex) factsFor(variable *types.Var) *nilFacts {
 	return facts
 }
 
-// definitelyNil deliberately answers only when nil is certain by source
-// position. Ambiguous control flow suppresses this predicate (and may still
-// permit a fix); the analyzer itself never treats a candidate expression as
-// proof of context. Source position is not execution order, so an assignment
-// written below a sink inside a loop still counts as unknown, not as nil.
+// definitelyNil reports a variable declared nil with no assignment written
+// before pos. It judges by source position, not execution order: an
+// assignment written after pos is ignored even when a loop runs it first, so
+// the variable still counts as nil and the fix is withheld rather than risk
+// inserting a nil context. A package-level variable assigned anywhere is never
+// definitely nil. The analyzer itself never treats a candidate expression as
+// proof of context.
 func (i *sourceIndex) definitelyNil(variable *types.Var, pos token.Pos) bool {
 	facts := i.nilIndex()[variable]
 	if facts == nil || !facts.declaredNil {
@@ -349,8 +351,9 @@ func (l *lineIndex) mark(tf *token.File, pos token.Pos) {
 	}
 }
 
-// standalone reports whether the comment occupies its line alone. A directive
-// that shares a line with code applies to that line, not to the next one.
+// standalone reports whether no code precedes the comment on its line. A
+// directive that follows code on its line applies to that line, not to the
+// next one.
 func (l *lineIndex) standalone(tf *token.File, comment *ast.Comment) bool {
 	code, ok := l.firstCode[tf.Line(comment.Pos())]
 	return !ok || code > comment.Pos()

@@ -2,6 +2,7 @@ package strictpkg
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/rs/zerolog"
@@ -75,7 +76,7 @@ func updateContextThroughAliasSet(ctx context.Context, cond bool) {
 		target = &other
 	}
 	target.UpdateContext(dropContext)
-	contextual.Info().Msg("UpdateContext through a may-alias address") // want `zerolog output is not proven to carry context before Msg\(\)`
+	contextual.Info().Msg("UpdateContext through a may-alias address keeps the context")
 }
 
 // Writing a tracked value into memory the analyzer cannot name is an escape.
@@ -144,9 +145,6 @@ func opaqueCalleeMayClearEvent(ctx context.Context, sink func(*zerolog.Event)) {
 	event.Msg("an opaque callee may have cleared the context") // want `zerolog output is not proven to carry context before Msg\(\)`
 }
 
-// A closure the analyzer does not follow may run anywhere, including inside a
-// range-over-func loop body or after the closure value has left the function.
-
 func runYield(yield func(int) bool) {
 	for index := range 3 {
 		if !yield(index) {
@@ -155,6 +153,8 @@ func runYield(yield func(int) bool) {
 	}
 }
 
+// A closure the analyzer does not follow may run anywhere, including inside a
+// range-over-func loop body or after the closure value has left the function.
 func rangeOverFuncClobbersCapture(ctx context.Context) {
 	logger := zerolog.New(io.Discard).With().Ctx(ctx).Logger()
 	for range runYield {
@@ -240,7 +240,14 @@ func methodValueInAField() {
 	holder.emit("outside the analyzer's boundary")
 }
 
-// buildssa does not instantiate generics, so a generic body is analysed once
+// A logger handed to code that only sees an io.Writer is written by that code,
+// out of the analyzer's sight: the same boundary as a method value in a field.
+func loggerAsAWriter() {
+	logger := zerolog.New(io.Discard)
+	_, _ = fmt.Fprintln(logger, "outside the analyzer's boundary")
+}
+
+// SSA is built without InstantiateGenerics, so a generic body is analysed once
 // with unknown type arguments and its sink is judged there.
 func emitThrough[T any](event *zerolog.Event, _ T) {
 	event.Msg("a sink inside a generic function") // want `zerolog output is not proven to carry context before Msg\(\)`
