@@ -18,6 +18,39 @@ func TestAnalyzer(t *testing.T) {
 		"./strictpkg", "./summaryprovider", "./summaryconsumer", "./indirectconsumer", "./logonlypkg")
 }
 
+func TestEventHeldRetainsDeferredRegister(t *testing.T) {
+	fn := fixtureFunction(t, "deferredSinkInLoop")
+	var site *ssa.Call
+	var receiver ssa.Value
+	for _, block := range fn.Blocks {
+		for _, instruction := range block.Instrs {
+			switch instruction := instruction.(type) {
+			case *ssa.Call:
+				if callee := instruction.Common().StaticCallee(); callee != nil && callee.Name() == "Info" {
+					site = instruction
+				}
+			case *ssa.Defer:
+				receiver = instruction.Common().Args[0]
+			}
+		}
+	}
+	if site == nil || receiver == nil {
+		t.Fatal("event creation or deferred receiver missing")
+	}
+	if availableAt(receiver, site) {
+		t.Fatal("fixture receiver must be stale when the creation site repeats")
+	}
+	current := newFrame()
+	location := eventLocation{value: site}
+	known := current.seedEvent(location, eventState{state: stateHasContext}, false)
+	// Only the defer keeps this prior iteration's register alive; neither
+	// ordinary register availability nor local memory retains it here.
+	remember(current, receiver, known)
+	if !newEngine(nil, nil).eventHeld(current, location) {
+		t.Fatal("the deferred receiver must retain the earlier event")
+	}
+}
+
 func TestSuggestedFixes(t *testing.T) {
 	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), Analyzer, "./fixpkg")
 }
