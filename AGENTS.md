@@ -16,12 +16,18 @@ diagnostic, never a pass.
 
 ## Layout
 
-- `zerologctx.go` — `Analyzer`, `run`, the state lattice and exported summary
-  facts. SSA is built per package in `buildPackageSSA` (on top of `ctrlflow`,
+- `zerologctx.go` — `Analyzer`, `run` and package eligibility. SSA is built per
+  package in `buildPackageSSA` (on top of `ctrlflow`,
   deliberately not `buildssa`) and skipped entirely when
   `refersToZerolog` finds neither a zerolog object nor a zerolog-typed value.
-- `dataflow.go` — abstract values, frames, the engine, per-SCC summary solving,
-  the zerolog transfer rules, `invalidateEscape` and `forgetEscaped`.
+- `dataflow.go` — control-flow engine, per-SCC solving, replay, later-call
+  scheduling and zerolog transfer rules.
+- `state.go` — the state lattice, abstract values and frames; owns reads,
+  stores, postconditions, `invalidateEscape` and alias/escape widening.
+- `calls.go` — call interpretation, receiver/binding alignment, reachable
+  inputs and callback targets.
+- `summary.go` — exported facts, semantic slots, accumulator joins, imported
+  fact normalization and terminal postcondition collection.
 - `recognition.go` — zerolog sink identification via `go/types`
   (`sinkForKind`, `classifySink`).
 - `reporting.go` — diagnostics, `//nolint` handling, and the `.Ctx(expr)`
@@ -53,7 +59,8 @@ Go 1.26.1 and 1.27.1.
 ## Hard rules
 
 Summarised from *Design constraints* in CONTRIBUTING.md — read that section
-before touching `dataflow.go`.
+before changing state, call interpretation or summary solving. Use
+[GLOSSARY.md](GLOSSARY.md) for analyzer terminology.
 
 - Uncertainty stays a diagnostic. No "probably safe" heuristics.
 - Identify zerolog through canonical package paths and `go/types` objects after

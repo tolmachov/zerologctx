@@ -2,14 +2,10 @@ package zerologctx
 
 import (
 	"go/types"
-	"os"
 	"testing"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/analysistest"
-	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
-	"golang.org/x/tools/go/ssa/ssautil"
 )
 
 // BenchmarkFrameJoin exercises every map a frame carries, including the
@@ -61,36 +57,42 @@ func BenchmarkLaterSinksLargeCFG(b *testing.B) {
 	}
 }
 
+// BenchmarkEventHeldAliases exercises stale register aliases next to unrelated
+// defers: the later-call scan should be linear, not repeated for every alias.
+func BenchmarkEventHeldAliases(b *testing.B) {
+	dataflow, fn := strictpkgFunction(b, "eventHeldAliases")
+	_, frames := dataflow.solve(fn)
+	var site *ssa.Call
+	for _, block := range fn.Blocks {
+		for _, instruction := range block.Instrs {
+			if call, ok := instruction.(*ssa.Call); ok {
+				if callee := call.Common().StaticCallee(); callee != nil && callee.Name() == "Info" {
+					site = call
+				}
+			}
+		}
+	}
+	if site == nil {
+		b.Fatal("event creation site missing")
+	}
+	current := frames.out[site.Block()]
+	location := eventLocation{value: site}
+	if dataflow.eventHeld(current, location) {
+		b.Fatal("unrelated defers retained a stale event")
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		dataflow.eventHeld(current, location)
+	}
+}
+
 // strictpkgFunction loads the strictpkg fixture and returns an engine over the
 // named function alone. The analyzer builds SSA without InstantiateGenerics,
 // so the benchmarks measure the SSA shape it actually sees.
 func strictpkgFunction(b *testing.B, name string) (*engine, *ssa.Function) {
 	b.Helper()
-	packagesUnderTest, err := packages.Load(&packages.Config{
-		Mode: packages.LoadAllSyntax,
-		Dir:  analysistest.TestData(),
-		Env:  append(os.Environ(), "GOWORK=off"),
-	}, "./strictpkg")
-	if err != nil {
-		b.Fatal(err)
-	}
-	if len(packagesUnderTest) != 1 {
-		b.Fatalf("loaded %d packages, want 1", len(packagesUnderTest))
-	}
-	for _, loadError := range packagesUnderTest[0].Errors {
-		b.Fatalf("load strictpkg: %v", loadError)
-	}
-	program, ssaPackages := ssautil.AllPackages(packagesUnderTest, ssa.BuilderMode(0))
-	program.Build()
-	fn, ok := ssaPackages[0].Members[name].(*ssa.Function)
-	if !ok {
-		b.Fatalf("%s SSA function not found", name)
-	}
+	fn := fixtureFunction(b, name)
 	pass := &analysis.Pass{
-		Fset:      packagesUnderTest[0].Fset,
-		Files:     packagesUnderTest[0].Syntax,
-		Pkg:       packagesUnderTest[0].Types,
-		TypesInfo: packagesUnderTest[0].TypesInfo,
 		// No other package was analysed, so none has exported a fact.
 		ImportObjectFact: func(types.Object, analysis.Fact) bool { return false },
 	}
